@@ -185,9 +185,9 @@ In this case, I think re-writing all our pseudo-abstract base classes as complet
 
 ###### Codecs must allocate memory for their outputs
 
-Each codec allocates its own memory for outputs in `encode` and `decode` operations. 
+Each codec allocates its own memory for outputs in `encode` and `decode` operations. This adds substantial overhead to chunk decoding, especially the common case of decoding an entire chunk.
 
-Solution: add `encode_into` and `decode_into` methods that don't allocate output buffers, and instead write into a caller-provided buffer. Combined with a codec context (codec pipeline) that managed buffer allocation, this will offer memory savings and simplify our model of what codecs have to do.
+Solution: add `encode_into` and `decode_into` methods that don't allocate output buffers, and instead write into a caller-provided buffer. Combined with a codec context (codec pipeline) that manages buffer allocation, this will offer memory savings and simplify our model of what codecs have to do. 
 
 ###### Codecs don't know about slicing
 
@@ -195,11 +195,19 @@ When we request 1 scalar from an NxM chunk, we allocate memory for the entire ch
 
 Solution: Formally represent how array -> array codecs transform array indices, and index scalars from arrays mid-decoding as soon as they are available. This would offer a massive reduction in memory use for sub-chunk indexing workloads.
 
+###### Codecs don't cache
+
+When the codec pipeline decodes a chunk, it throws that decoded chunk away. This means requesting the same chunk again will trigger the same compute, which is wasteful if the data hasn't changed.
+
+Solution: Array -> Array codecs that decode a full chunk should cache that decoded chunk, and re-use it later when subslices are requested. This is something Zarrs does. Combined with giving codecs a model of array selection (slicing) we can get a huge reduction in compute by spending some memory on a cache.
+
 ###### We should learn from Zarrs and Tensorstore
 
-There are *many* things we could copy from Zarrs and Tensorstore to improve codec performance. 
+There are *many* things we could copy from Zarrs and Tensorstore to improve codec performance.
 
-We should also support directly relying on Zarrs and Tensorestore for chunk encoding / decoding. That means designing our codec API so that its pluggable over different backends. The `CodecPipeline` class today acheives this somewhat, but using Zarrs as a backend still required a [dedicated Python package](https://github.com/zarrs/zarrs-python/). We should learn from this effort and restructure our codec APIs to make this binding simpler.
+We should also accept reality: a Python library cannot realistically compete on performance with an optimized Rust or C++ solution. So we should *simply not compete*. Instead, we should wrap Zarrs and Tensorestore for chunk encoding / decoding. That means designing our codec API so that its pluggable over different backends. The `CodecPipeline` class today acheives this somewhat, but using Zarrs as a backend still required a [dedicated Python package](https://github.com/zarrs/zarrs-python/). We should learn from this effort and restructure our codec APIs to make this binding simpler.
+
+Today, we tell people with serious performance demands to use Tensorstore or Zarrs. I would rather tell them to keep using Zarr Python, but with a Tensorstore / Zarrs backend.
 
 ##### V2 codecs with no V3 equivalent
 
@@ -247,13 +255,19 @@ _draft notes_
 
 - Stores can wrap other stores, but it's an awkward pattern that relies on inheritance We should have a compositional approach that models a store as a set of capabilities layered on top of a storage primitive, rather than a single type. Structural typing via protocols would help here, see [obspec](https://github.com/developmentseed/obspec), and also [zarrita](https://github.com/manzt/zarrita.js).
 
+##### The `Store` API is missing basic idioms necessary for high performance
+
+_draft notes_
+
+- We don't expose a caching layer on our latency-sensitive stores. For immutable datasets, we are wasting huge amounts of user time and IO. We do have an [experimental caching layer](https://zarr.readthedocs.io/en/stable/api/zarr/experimental/#zarr.experimental.cache_store) which has been rather popular but we don't have a plan for migrating this feature to the main codebase.
+- We don't coalesce multiple byte-range reads. There's a [PR](https://github.com/zarr-developers/zarr-python/pull/3004) that would add this feature but it requires infrastructure currently missing from the Store API.
+
+
 #### Data types
 
 _draft notes_
 
-- Structured dtypes ([zarr#2134](https://github.com/zarr-developers/zarr-python/issues/2134))
-- Variable-length strings ([zarr#3102](https://github.com/zarr-developers/zarr-python/issues/3102))
-- bfloat16 ([zarr#2656](https://github.com/zarr-developers/zarr-python/issues/2656))
+- bfloat16 and mldtypes ([zarr#2656](https://github.com/zarr-developers/zarr-python/issues/2656))
 - Ragged arrays ([zarr#2618](https://github.com/zarr-developers/zarr-python/issues/2618))
 - Dtype-codec interactions ([zarr#3491](https://github.com/zarr-developers/zarr-python/issues/3491))
 - Dtype registry issues ([zarr#3117](https://github.com/zarr-developers/zarr-python/issues/3117), [zarr#3282](https://github.com/zarr-developers/zarr-python/issues/3282))
