@@ -33,6 +33,10 @@ To reach this I think we should push in the following directions:
 - Support the growth of Python tools that don't use Zarr-Python explicitly.  
 - Accelerate the implementation of new codecs, chunk grids, chunk key encodings, etc. 
 
+## What I'm afraid of
+
+I worry that if we don't keep moving forward as a library, we will fall behind. If Zarr Python is too slow to improve performance, add features, and make APIs better, users will use other Python tools like Tensorstore, or simply not use Zarr at all. We have a lot of inertia, thanks to projects like Dask and Xarray, but that can change *very quickly* if someone motivated stands up a cleaner, faster, better Python-based Zarr library. We should run that cleaner, faster, better library. The following sections outlines my vision for how we can make that happen.
+
 ### What to change
 
 If we want Zarr-Python to support the growing ecosystem of Python tools that work with Zarr data, I think we need to make some concrete changes, which I have divided by category. In each case I identify concrete changes we can make that would make the Zarr Python project a better foundation for the Zarr ecosystem.
