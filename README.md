@@ -35,7 +35,7 @@ To reach this I think we should push in the following directions:
 
 ## What I'm afraid of
 
-I worry that if we don't keep moving forward as a library, we will fall behind. If Zarr Python is too slow to improve performance, add features, and make APIs better, users will use other Python tools like Tensorstore, or simply not use Zarr at all. We have a lot of inertia, thanks to projects like Dask and Xarray, but that can change *very quickly* if someone motivated stands up a cleaner, faster, better Python-based Zarr library. We should run that cleaner, faster, better library. The following sections outlines my vision for how we can make that happen.
+I worry that if we don't keep moving forward as a library, we will fall behind. If Zarr Python is too slow to improve performance, add features, and make APIs better, users will adopt other Python tools like Tensorstore, or simply not use Zarr at all. We have a lot of inertia, thanks to projects like Dask and Xarray, but that can change *very quickly* if someone motivated stands up a cleaner, faster, better Python-based Zarr library. We should run that cleaner, faster, better library. The following sections outlines my vision for how we can make that happen.
 
 ### What to change
 
