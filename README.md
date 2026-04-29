@@ -235,32 +235,67 @@ Solution: we aim to eliminate Zarr-Python's Numcodecs dependency. We can do this
 
 #### Stores
 
-_draft notes_
+The `Store` abstraction is the lowest layer of Zarr-Python and the place where the 3.0 redesign carries the most accumulated debt. The current API was shaped for "support arbitrary backends via fsspec, with cloud-friendly latency," and it does that. But it conflates several concerns (path handling, capability modeling, sync vs async, lifecycle) into a single nominal class hierarchy, and the inheritance-based extension model has produced a stream of regressions whenever the `FsspecStore` join logic, path normalization, or backend-detection has been touched.
+
+The 4.0 direction should be: **stores are sets of capabilities, composed from protocols, with backend-specific path handling pushed to backend-specific stores rather than enforced generically.** The `obstore`-backed store is already organized this way, and so is `obspec`'s capability protocol set. We should treat them as the model and bring the rest of the store layer in line.
 
 ##### The `Store` API is unwieldy
 
-_draft notes_
+The current `Store` ABC bundles together several axes that should be modeled independently:
 
-- stores are stateful, should be stateless
-- stores do not have a path, limits usefulness in top-down zarr hierarchies
-- stores methods are all async
-- store methods require useless parameters (prototype)
-- stores have confusing read-only semantics
-- stores require an async creation routine
-- atomic / transactional writes — V3 lost V2's atomic rename-into-place semantics ([zarr#3410](https://github.com/zarr-developers/zarr-python/discussions/3410), [zarr#3094](https://github.com/zarr-developers/zarr-python/discussions/3094))
+- **Stateful vs stateless.** Stores carry `_is_open`, allowed-exception sets, prototype caches, and read-only flags. They should be stateless capability objects that are cheap to instantiate; lifecycle (open/close, transactional state) should live in a separate context type.
+- **Paths.** Stores currently do not own a path, which limits their usefulness in top-down hierarchy traversal and forces the surrounding `StorePath` wrapper to carry path state. Most real-world store usage pairs a store instance with a fixed root, and modeling that pairing in the type system would simplify equality, hashing, and serialization.
+- **Sync vs async.** All store methods are async, including those backing fundamentally synchronous backends (`MemoryStore`, `LocalStore`, `ZipStore`). This forces wrapper layers like `_make_async` and `AsyncFileSystemWrapper`, which have themselves been a source of bugs ([zarr#3195](https://github.com/zarr-developers/zarr-python/pull/3195)). Sync-default with an opt-in async layer would map more cleanly onto the underlying backends.
+- **Useless parameters.** `prototype` is required on every read call but ignored by most backends. It belongs in a configuration object, not the per-call signature.
+- **Read-only semantics.** `read_only` is a boolean flag mutable via `with_read_only()`. The semantics of writes-after-readonly-clone, equality across read-only variants, and capability advertisement are inconsistent.
+- **Async creation.** Several stores require `await Store.open(...)` before use. The reason is mostly to perform an async existence check; this could be deferred to first-use or hoisted into a synchronous probe.
+- **Atomic and transactional writes.** V3 lost V2's atomic rename-into-place semantics ([zarr#3410](https://github.com/zarr-developers/zarr-python/discussions/3410), [zarr#3094](https://github.com/zarr-developers/zarr-python/discussions/3094)). The pieces exist (Icechunk demonstrates a transactional model) but they need to be reflected in the Store API surface, not bolted on.
 
 ##### The `Store` API is hard to extend
 
-_draft notes_
+Stores can wrap other stores, but the pattern relies on inheritance and method override. This produces three concrete problems:
 
-- Stores can wrap other stores, but it's an awkward pattern that relies on inheritance We should have a compositional approach that models a store as a set of capabilities layered on top of a storage primitive, rather than a single type. Structural typing via protocols would help here, see [obspec](https://github.com/developmentseed/obspec), and also [zarrita](https://github.com/manzt/zarrita.js).
+- **Capability erasure.** A wrapper that adds caching has to subclass `Store`, which means its type no longer advertises which underlying capabilities are present. Code that wants to know "does this store support range reads?" cannot ask the type system.
+- **Diamond inheritance.** Combining wrappers (caching + tracing + retry) requires linearizing the MRO and hoping no override conflicts. In practice users write a single bespoke wrapper rather than compose primitives.
+- **No protocol surface for partial implementers.** A backend that only supports reads has to implement (or stub) the full `Store` ABC, including write methods that raise.
+
+The right model is the one [obspec](https://github.com/developmentseed/obspec) uses: structural protocols for individual capabilities (`Get`, `GetRange`, `Put`, `Delete`, `List`, `Head`, `Copy`, `Multipart`), with backends declaring which they implement. [zarrita](https://github.com/manzt/zarrita.js) takes a similar protocol-first approach. Concrete proposal:
+
+- Define capability protocols in zarr's storage layer that mirror or directly reuse `obspec`'s.
+- Replace `Store` ABC subclassing with composition: a `Store` is "anything that satisfies the read capability subset I need."
+- Wrappers (caching, tracing, range coalescing, retry, read-only enforcement) become protocol-preserving adapters: a `CachingStore[S]` advertises the same protocols as `S`.
+- Backends that only support reads (HTTP, ReferenceFileSystem) advertise only the read protocols. Code that requires write capability fails at type-check time, not runtime.
+
+##### Path handling is backend-specific and should not be enforced generically
+
+`FsspecStore` has accumulated a recurring bug pattern around path normalization. The same shape recurs every six to twelve months: someone observes that paths from one backend cause a problem, adds a backend-agnostic normalization step, and that step then breaks a different backend's path semantics. A few cycles from the recent record:
+
+- [zarr#2348](https://github.com/zarr-developers/zarr-python/pull/2348) added "raise error if path includes scheme," which was reverted in [zarr#3343](https://github.com/zarr-developers/zarr-python/pull/3343) when swift-fs was found to need the scheme in the path.
+- [zarr#3193](https://github.com/zarr-developers/zarr-python/pull/3193) backed out a check about `auto_mkdir` because not all fsspec backends support it.
+- [zarr#3679](https://github.com/zarr-developers/zarr-python/pull/3679) refactored the `FsspecStore` join logic from `_dereference_path` to `_join_paths`, introducing a `path="/"` regression for `ReferenceFileSystem` reported as [zarr#3922](https://github.com/zarr-developers/zarr-python/issues/3922).
+- [zarr#3924](https://github.com/zarr-developers/zarr-python/pull/3924) attempted to fix #3922 by applying the zarr-key-level `normalize_path` helper to the constructor's `path` argument. That stripped leading slashes and broke absolute-path access on `LocalFileSystem`, surfacing as broken `titiler-xarray` upstream tests.
+- [zarr#3926](https://github.com/zarr-developers/zarr-python/pull/3926) reverts the off-target change in #3924 and restores the v3.1.6 verbatim-path contract on the join sites.
+
+The takeaway is not "we keep getting it wrong." The takeaway is that **a backend-agnostic path normalization routine cannot exist**, because path semantics are backend-specific in incompatible ways: a leading slash is meaningful on `LocalFileSystem` (absolute vs CWD-relative) but discarded by `S3FileSystem._strip_protocol`; a `"/"` is a sentinel for "no prefix" on `ReferenceFileSystem` but a real filesystem root on local; backslashes are valid bytes in S3 keys but path separators on Windows; `..` is a meaningful component on POSIX but rejected by S3 key validators. Any zarr-side normalization that picks one of these wins picks against another.
+
+The sustainable design treats path handling as a backend concern:
+
+- **Generic `FsspecStore` becomes a thin verbatim-path wrapper.** The store stores `path` exactly as given, joins it with keys via a uniform helper that handles only the empty-root and trailing-slash cases (the v3.1.6 `_dereference_path`), and otherwise does no normalization. This is the contract #3926 restores; it should be documented in the constructor docstring so future contributors do not re-add normalization. Use it across all I/O sites including the listing methods (`list`/`list_dir`/`list_prefix`), which currently still concatenate with raw f-strings and have a pre-existing `path="/"` bug independent of #3926.
+- **An optional `validate_path` hook.** Default no-op. Users wrapping unusual backends (HuggingFaceFileSystem, WebdavFileSystem, custom community backends) can supply a callable to enforce backend-specific construction-time checks without zarr-python having to ship a class for every backend that exists.
+- **First-class cloud stores route through `obstore`.** `ObstoreStore` already provides per-backend types (`S3Store`, `GCSStore`, `AzureStore`, `HTTPStore`) that enforce backend-specific path validation at construction. For S3, GCS, Azure, and HTTP, this is the better path; `FsspecStore` becomes the fallback for backends `obstore` does not cover (memory, reference, FTP/SFTP, custom fsspec backends).
+- **Family-level `FsspecStore` subclasses, if needed.** If specific fsspec backends accumulate enough quirks to warrant it, introduce a small set of family classes (bare-key, absolute-path, bucket-key) rather than a class per protocol. Three classes cover most real divergence; per-protocol classes (`LocalFsspecStore`, `S3FsspecStore`, ...) duplicate logic and do not help custom backends.
+
+This direction is consistent with the "compositional, capability-based" goal in the previous subsection: backend-specific stores are a refinement of the protocol surface, not a parallel inheritance hierarchy.
 
 ##### The `Store` API is missing basic idioms necessary for high performance
 
-_draft notes_
+- **Caching.** We do not expose a caching layer on our latency-sensitive stores. For immutable datasets we are wasting huge amounts of user time and IO. The [experimental caching layer](https://zarr.readthedocs.io/en/stable/api/zarr/experimental/#zarr.experimental.cache_store) has been popular but has no migration plan to the main codebase. Caching belongs in the wrapper-protocol design above: a `CachingStore[S]` adapter that preserves `S`'s capabilities and adds memoization, with eviction policies and TTL exposed as configuration. Open issues: [zarr#278](https://github.com/zarr-developers/zarr-python/issues/278), [zarr#382](https://github.com/zarr-developers/zarr-python/issues/382), [zarr#2988](https://github.com/zarr-developers/zarr-python/issues/2988), [zarr#3570](https://github.com/zarr-developers/zarr-python/issues/3570).
+- **Range coalescing.** We do not coalesce multiple byte-range reads. The [PR adding this](https://github.com/zarr-developers/zarr-python/pull/3004) requires infrastructure currently missing from the Store API. A protocol-based design makes this natural: a `GetRanges` capability advertises batch range fetching, a coalescing wrapper transforms many `GetRange` calls into one `GetRanges` call, and stores that already support batch fetching (S3 via `cat_ranges`, obstore's `get_ranges`) skip the wrapper.
+- **Concurrent capability advertisement.** The protocol surface should advertise concurrency-safety guarantees so callers can pick batching strategies without probing. Today every caller has to know which backends are async-safe, which are thread-safe, and which are neither.
 
-- We don't expose a caching layer on our latency-sensitive stores. For immutable datasets, we are wasting huge amounts of user time and IO. We do have an [experimental caching layer](https://zarr.readthedocs.io/en/stable/api/zarr/experimental/#zarr.experimental.cache_store) which has been rather popular but we don't have a plan for migrating this feature to the main codebase.
-- We don't coalesce multiple byte-range reads. There's a [PR](https://github.com/zarr-developers/zarr-python/pull/3004) that would add this feature but it requires infrastructure currently missing from the Store API.
+##### Proposed public API
+
+A scaffolding sketch of the capability protocols, backend stores, wrappers, transactions, and migration story is in [proposals/stores-api.md](./proposals/stores-api.md). It is concrete enough to argue about but not committed to specific names or module layout.
 
 
 #### Data types
