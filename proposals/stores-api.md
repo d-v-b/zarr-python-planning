@@ -133,6 +133,301 @@ def relativize_path(*, path: str, prefix: str) -> str:
     `prefix/` from `path` if present."""
 ```
 
+## Bounds and composite stores
+
+`Get`, `Put`, `List`, etc. are sufficient to model a single backend over a single keyspace. Two adjacent capabilities are missing and worth resolving together because they share one primitive (`KeyRange`):
+
+1. **Bounded stores.** A store may want to advertise that its visible keyspace is a sub-range of the underlying backend's full keyspace. Sharding (a shard owns a `KeyRange` of chunk-keys), consolidated-metadata-as-overlay (the overlay covers only metadata keys), and read/write scope safety (a worker handed a store can only touch its assigned slice) all want this.
+2. **Composite stores.** A store may compose N base stores, each bound to a disjoint `KeyRange`, dispatching each operation to whichever base owns the key. Tiered storage (hot keys local, cold keys cloud), mixed-backend arrays, consolidated metadata, and migration patterns all want this.
+
+TensorStore models both via a single `KeyRange` primitive and a `kvstack` driver ([TensorStore KvStore.KeyRange](https://google.github.io/tensorstore/python/api/tensorstore.KvStore.KeyRange.html), [kvstack driver](https://google.github.io/tensorstore/kvstore/kvstack/index.html)). zarrs, zarrita, and obstore have neither concept; obstore exposes a `start_after` listing parameter that handles part of the bounded-listing case but does not generalize to composites.
+
+The decision below commits zarr-python to the TensorStore-shaped primitive. The motivating reason is composite stores: a `start_after`-only design handles single-store listing bounds but cannot express the per-layer ranges a composite needs. Committing to `KeyRange` from day one keeps a single coherent bounds vocabulary across the protocol family.
+
+### `KeyRange`
+
+```python
+# zarr/storage/keyrange.py
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class KeyRange:
+    """A half-open interval `[inclusive_min, exclusive_max)` in
+    lexicographic key order. Both ends are raw key strings; an empty
+    string for `inclusive_min` means "no lower bound" and `None` for
+    `exclusive_max` means "no upper bound".
+
+    Used to describe the keyspace a bounded store covers and the
+    per-layer ranges of a composite store.
+
+    Modeled on TensorStore's `KvStore.KeyRange`."""
+
+    inclusive_min: str = ""
+    exclusive_max: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.exclusive_max is not None and self.inclusive_min >= self.exclusive_max:
+            raise ValueError(
+                f"KeyRange is empty: inclusive_min={self.inclusive_min!r} >= "
+                f"exclusive_max={self.exclusive_max!r}"
+            )
+
+    @classmethod
+    def from_prefix(cls, prefix: str) -> "KeyRange":
+        """KeyRange covering exactly the keys that start with `prefix`.
+        The upper bound is `prefix` with the last byte incremented; if
+        prefix is empty, the result is unbounded."""
+        if not prefix:
+            return cls()
+        last = prefix[-1]
+        if last == "￿":
+            # No representable next character; fall back to an explicit
+            # large sentinel. Callers needing exact prefix semantics on
+            # arbitrary unicode should use contains() rather than relying
+            # on the bound directly.
+            return cls(inclusive_min=prefix)
+        return cls(inclusive_min=prefix, exclusive_max=prefix[:-1] + chr(ord(last) + 1))
+
+    def contains(self, key: str) -> bool:
+        if key < self.inclusive_min:
+            return False
+        if self.exclusive_max is not None and key >= self.exclusive_max:
+            return False
+        return True
+
+    def overlaps(self, other: "KeyRange") -> bool:
+        """True iff `self` and `other` share at least one key."""
+        lo = max(self.inclusive_min, other.inclusive_min)
+        hi_self = self.exclusive_max
+        hi_other = other.exclusive_max
+        if hi_self is None and hi_other is None:
+            return True
+        hi = hi_self if hi_other is None else hi_other if hi_self is None else min(hi_self, hi_other)
+        return lo < hi
+
+    def intersect(self, other: "KeyRange") -> "KeyRange | None":
+        """Intersection of two ranges, or None if disjoint."""
+        if not self.overlaps(other):
+            return None
+        lo = max(self.inclusive_min, other.inclusive_min)
+        if self.exclusive_max is None:
+            hi = other.exclusive_max
+        elif other.exclusive_max is None:
+            hi = self.exclusive_max
+        else:
+            hi = min(self.exclusive_max, other.exclusive_max)
+        return KeyRange(inclusive_min=lo, exclusive_max=hi)
+```
+
+`KeyRange` is plain data: no I/O, no backend coupling. It lives at the top of the storage module so backends, wrappers, and the array layer can all use it.
+
+### Listing methods take `range`
+
+The `List` and `ListWithDelimiter` protocols defined in the [Capability protocols section](#capability-protocols) gain an optional `range: KeyRange | None = None` argument:
+
+```python
+@runtime_checkable
+class List(Protocol):
+    def list(
+        self,
+        prefix: str | None = None,
+        *,
+        offset: str | None = None,
+        range: KeyRange | None = None,
+    ) -> Iterator[str]: ...
+
+
+@runtime_checkable
+class ListWithDelimiter(Protocol):
+    def list_with_delimiter(
+        self,
+        prefix: str | None = None,
+        *,
+        range: KeyRange | None = None,
+    ) -> "ListResult": ...
+```
+
+When `range` is provided, the listing yields only keys in `range`. Backends that can push the bound to the wire (S3 `StartAfter`, GCS `startOffset`/`endOffset`, local sorted iteration) do so; others filter client-side. Either way the contract is the same. `prefix` and `range` compose: a call passing both yields keys that start with `prefix` *and* fall in `range`.
+
+This is a backwards-compatible extension to the listing protocols if `range=None` is the default and existing callers are unchanged. Async variants follow the same shape.
+
+### Bounded backends
+
+Every backend store has an implicit `bounds: KeyRange` describing the keyspace it covers. The default is `KeyRange()` (unbounded). Backends that own a sub-range expose it as a property:
+
+```python
+class LocalStore:
+    def __init__(
+        self,
+        root: Path | str,
+        prefix: str = "",
+        *,
+        bounds: KeyRange | None = None,
+        mkdir: bool = False,
+    ) -> None: ...
+
+    @property
+    def bounds(self) -> KeyRange: ...
+
+    def __truediv__(self, sub: str) -> "LocalStore":
+        """Returns a new LocalStore with the prefix extended by `sub`.
+        Bounds, if set, narrow to the intersection with the new prefix's
+        natural range."""
+        ...
+```
+
+Per-key operations on a bounded backend that receive a key outside `bounds` raise `KeyError`. The store's universe *is* `bounds`; out-of-bounds keys are not present from this store's perspective. This matches TensorStore's behavior for sharded reads and is the choice that makes bounded stores composable with the rest of the design (a composite that dispatches by range can rely on `KeyError` from out-of-bounds keys to detect mis-routing).
+
+Listing operations on a bounded backend, when `range=None` is passed, yield only keys in `bounds`. When `range` is passed, yield only keys in `bounds.intersect(range)` (raising `ValueError` if the intersection is empty).
+
+The `bounds` property is what `KvStack` (below) reads to validate that its layers are disjoint and to choose the right layer for each key.
+
+### `KvStack[S]`: composite store
+
+```python
+# zarr/storage/wrappers.py (continued)
+
+class KvStack[S]:
+    """Composite store dispatching per-key to one of N base stores by
+    KeyRange. Modeled on TensorStore's `kvstack` driver.
+
+    Layers are an ordered sequence of `(KeyRange, S)` pairs. The ranges
+    must be pairwise disjoint; the constructor raises `ValueError`
+    otherwise. Operations on a key dispatch to the unique layer whose
+    range contains it; keys outside every layer raise `KeyError`.
+
+    Listing fans out to layers whose ranges overlap the requested range
+    and merges results in lexicographic order.
+
+    Capability advertisement is the **intersection** of the layers'
+    capability surfaces: `KvStack[S]` advertises `Get` only if every
+    layer satisfies `Get`, `Put` only if every layer satisfies `Put`,
+    and so on. The honest surface; a layer that cannot satisfy a
+    capability cannot be silently bypassed."""
+
+    def __init__(self, layers: Sequence[tuple[KeyRange, S]]) -> None:
+        # Validate disjointness.
+        sorted_layers = sorted(layers, key=lambda t: t[0].inclusive_min)
+        for i in range(1, len(sorted_layers)):
+            prev_range, _ = sorted_layers[i - 1]
+            curr_range, _ = sorted_layers[i]
+            if prev_range.overlaps(curr_range):
+                raise ValueError(
+                    f"KvStack layers must be disjoint; "
+                    f"{prev_range} overlaps {curr_range}"
+                )
+        self._layers = sorted_layers
+
+    def _route(self, key: str) -> S:
+        for kr, layer in self._layers:
+            if kr.contains(key):
+                return layer
+        raise KeyError(f"no layer covers key {key!r}")
+
+    def get(self: "KvStack[Get]", key: str) -> memoryview:
+        return self._route(key).get(key)
+
+    def put(self: "KvStack[Put]", key: str, value: bytes | memoryview) -> None:
+        self._route(key).put(key, value)
+
+    def delete(self: "KvStack[Delete]", key: str) -> None:
+        self._route(key).delete(key)
+
+    def list(
+        self: "KvStack[List]",
+        prefix: str | None = None,
+        *,
+        offset: str | None = None,
+        range: KeyRange | None = None,
+    ) -> Iterator[str]:
+        # Restrict to layers whose range overlaps the requested range
+        # (or all layers if range is None). Yield in lex order; because
+        # layer ranges are disjoint and pre-sorted, concatenating each
+        # layer's listing in layer order is already lex-ordered.
+        ...
+
+    # Async variants follow the same shape.
+```
+
+The capability-intersection rule is what makes `KvStack` honest. If a user constructs `KvStack([(r1, read_only_s1), (r2, read_write_s2)])`, the resulting store only advertises `Get` (and other read capabilities) — calling `put(...)` would silently route to `s1` or `s2` depending on the key, and silently fail on `s1` is exactly the bug class the protocol-based redesign is trying to retire. Failing at the type/protocol layer instead is the correct contract.
+
+`KvStack[S]` itself satisfies `bounds`: its `bounds` is the union-bounding-box of its layers' ranges. A layer whose `bounds` extends beyond its declared `KeyRange` (because the underlying backend covers more keys than the stack assigns to it) is *itself* a bounded view: the stack effectively narrows each layer's keyspace to the layer's `KeyRange`. Nested `KvStack`s are well-defined; the outer stack's layers can themselves be `KvStack` instances.
+
+### Worked examples
+
+```python
+# 1) Tiered metadata + chunks: metadata locally, chunks on S3.
+from zarr.storage.keyrange import KeyRange
+from zarr.storage.wrappers import KvStack
+from zarr.storage.stores.local import LocalStore
+from zarr.storage.stores.obstore import ObstoreStore
+
+store = KvStack([
+    (KeyRange.from_prefix("zarr.json"), LocalStore("/cache/metadata")),
+    (KeyRange.from_prefix("c/"), ObstoreStore(s3_store)),
+])
+# Reads/writes of "zarr.json" route to local; reads of "c/0/0" route to S3.
+
+# 2) Migration: read from new store, fall through to old via key-prefix carve.
+# (Disjoint ranges, not "fall through on miss" — that pattern needs a different
+# wrapper, see open questions below.)
+store = KvStack([
+    (KeyRange(exclusive_max="2026/"), legacy_store),
+    (KeyRange(inclusive_min="2026/"), new_store),
+])
+
+# 3) Consolidated-metadata-as-overlay: metadata served from a fast in-memory
+# store synthesized from a consolidated file; chunks fall through to the real
+# backend.
+overlay = MemoryStore.from_consolidated(consolidated_json)
+store = KvStack([
+    (KeyRange.from_prefix("zarr.json"), overlay),
+    (KeyRange.from_prefix("c/"), real_store),
+])
+# Hits on metadata keys are served by `overlay` without touching the network.
+
+# 4) Sharded array: each shard is a bounded view of an underlying object.
+# (Sketch; the actual sharding-as-composite redesign is a follow-up.)
+shard_layers = [
+    (KeyRange(inclusive_min=f"c/{i*64}", exclusive_max=f"c/{(i+1)*64}"),
+     bounded_view(shard_objects[i], chunk_range_for_shard(i)))
+    for i in range(num_shards)
+]
+chunks_store = KvStack(shard_layers)
+```
+
+### Conformance
+
+Two new specs land in [stores-conformance.md](./stores-conformance.md):
+
+- **`KeyRangeListSpec`** parameterizes over backends that satisfy `List`. Asserts `range` filtering yields exactly the expected keys, that combining `prefix` and `range` intersects correctly, and that empty intersections yield no keys without erroring.
+- **`KvStackSpec`** asserts disjointness validation at construction, correct routing on per-key operations, lex-ordered merged listing, capability intersection (constructing a stack with mixed read/write layers advertises only read capabilities), and that out-of-coverage keys raise `KeyError`.
+
+`CapabilityPreservationSpec` runs against `KvStack` with the modification that the wrapper preserves the *intersection* of inner capabilities, not the union or pass-through.
+
+### Migration
+
+This subsection's commitments are additive:
+
+- `KeyRange` is a new dataclass; nothing currently uses it.
+- `range` argument on `List` / `ListWithDelimiter` is a new optional parameter; existing callers unchanged.
+- `bounds` property on backends is new; defaults to `KeyRange()` (unbounded) for everything that doesn't opt in.
+- `KvStack[S]` is a new wrapper; nothing has to migrate to use it.
+
+The sharding codec migration to `KvStack`-shaped composites is explicitly future work, not initial scope. Consolidated metadata migration to `KvStack`-shaped overlays is the natural validation use case for the design and can be tackled in the same release that ships `KvStack`, since consolidated metadata is independently being reconsidered (see the [README's consolidated-metadata section](../README.md#consolidated-metadata)).
+
+### Open questions
+
+- **`bytes` vs `str` for `KeyRange` bounds.** TensorStore uses `bytes` for `KeyRange.inclusive_min` and `exclusive_max` ([KvStore.KeyRange](https://google.github.io/tensorstore/python/api/tensorstore.KvStore.KeyRange.html), documented as "half-open interval of byte string keys, according to lexicographical order"). The byte-typed choice is principled: successor functions ("next key after `p`"), cloud-backend wire comparison (S3 / GCS / Azure compare keys lexicographically as UTF-8 bytes, not as unicode codepoints), and sentinels for "highest possible key" (`b'\xff' * N`) are all cleanly expressible for bytes and ad-hoc for unicode strings. The kludge in `KeyRange.from_prefix` above (the `'￿'` fallback for the high end of unicode) is the visible symptom of using `str`. zarr-python's protocol uses `str` keys throughout, which is consistent with current practice and matches Zarr V3 spec keys (which are ASCII-restricted, so the str/bytes equivalence is faithful). Revisit if non-ASCII keys ever become a real use case, or if the `KeyRange.from_prefix` corner case bites a real user. The migration would be additive: a `bytes`-typed parallel API alongside the `str`-typed one, with the `str` version converting at the boundary.
+- **Fall-through composition.** `KvStack` requires disjoint ranges. The migration pattern "read from new, fall through to old on miss" wants overlapping ranges with priority. That is a different wrapper (`Layered[S]` or `Fallthrough[S]`) and a different composition algebra. Out of scope here; flag for a follow-up if the migration use case becomes load-bearing. The conservative interim is "manage the migration with disjoint key prefixes and a `KvStack`," which is enforceable by a one-time backfill.
+- **Per-layer prefix transformation.** TensorStore's `kvstack` driver supports per-layer prefix-stripping (a layer's underlying store sees keys with the layer's prefix removed). zarr-python's design with prefix-on-the-backend makes this less necessary — each layer can carry its own prefix internally — but a `subtract_prefix` constructor option may still be useful for layers wrapping shared backends. Out of scope for the initial wrapper; revisit if real use cases need it.
+- **List ordering with prefix-stripping wrappers.** If a layer presents post-prefix keys but the composite lists pre-prefix keys, the merge has to re-add the prefix before yielding. The straightforward case (no prefix transformation) is unambiguous; the prefix-stripping case is one open question deeper.
+- **Cross-layer transactions.** A `Transactional[KvStack[Transactional[S]]]` writes that span layers cannot be atomic without a coordinator. Document that transactions are per-layer; multi-layer atomicity is out of scope (the cross-store-transactions point already in the [transactional proposal](./stores-transactional.md#open-questions) covers this).
+- **Empty stack semantics.** `KvStack([])` is a store that owns no keys. Every operation raises `KeyError`. Useful as a degenerate base case for programmatic construction; document it as well-defined rather than an error.
+- **`KeyRange` representation for non-string keys.** The current spec assumes lex-ordered string keys, which matches the rest of the storage protocol. If the storage protocol ever supports non-string keys (bytes, structured), `KeyRange` would need to generalize. Punt; revisit if the underlying assumption changes.
+
 ## Path ownership and Prefixed wrapper
 
 ```python
