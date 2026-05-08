@@ -109,6 +109,199 @@ class Transactional(Protocol):
 # See the README's sync-by-default subsection for the per-backend mapping.
 ```
 
+## GPU and zero-copy reads via `GetInto`
+
+`Get`, `GetRange`, and `GetRanges` follow an allocation-based contract: the store allocates the result buffer, fills it, and returns it. This is the right shape for the common case (CPU reads from CPU-shaped backends) and matches every role-model storage API: TensorStore's `KvStore.read` allocates ([KvStore.read](https://google.github.io/tensorstore/python/api/tensorstore.KvStore.read.html)), zarrs's `ReadableStorageTraits::get` allocates ([ReadableStorageTraits](https://docs.rs/zarrs_storage/latest/zarrs_storage/trait.ReadableStorageTraits.html)), zarrita's `Readable.get` allocates, obstore's `get` allocates.
+
+But the allocation-based contract leaves zero-copy GPU-direct reads on the table. Today's `prototype: BufferPrototype` argument was an attempt to address this — by letting the caller specify "give me back a GPU buffer" — but the README's [decoupling-prototype subsection](../README.md#decoupling-prototype-from-the-read-api) admits the GPU path is fictional in current zarr-python: even with `gpu_buffer_prototype`, the bytes hit the CPU first because neither fsspec nor obstore knows how to allocate on the device. `prototype` is a knob that doesn't actually wire up.
+
+The honest design is to push buffer ownership to the *caller* via a `GetInto` protocol family. The caller allocates the destination buffer (CPU or GPU); the store writes into it. Backends that can DMA directly into device memory (a future GDS-aware obstore, a kvikio-backed store) advertise `GetInto`; backends that can't simply don't advertise it. Callers who need GPU-direct-storage ask for `GetInto` at the type level; everyone else uses the allocation-based `Get`.
+
+This is opt-in additive surface alongside `Get`, not a replacement.
+
+### Capability protocols
+
+```python
+# zarr/storage/protocols.py (continued)
+
+@runtime_checkable
+class GetInto(Protocol):
+    """Read into a caller-provided writable buffer. The buffer must be
+    at least as large as the value; the store fills it and returns a
+    ReadResult whose `value` is a memoryview over the prefix of the
+    buffer that was filled. The generation is reported the same way
+    `Get` reports it.
+
+    Backends that can DMA directly into the destination buffer
+    (CUDA-aware HTTP, NVIDIA GDS, kvikio-backed storage) avoid the
+    intermediate CPU buffer entirely. Backends without that capability
+    do not implement this protocol; callers who want zero-copy GPU
+    reads use the type system to require `GetInto` and get a clear
+    type error when a backend that cannot deliver is passed in."""
+
+    def get_into(self, key: str, buffer: "WritableBuffer") -> ReadResult: ...
+
+
+@runtime_checkable
+class GetRangeInto(Protocol):
+    def get_range_into(
+        self,
+        key: str,
+        buffer: "WritableBuffer",
+        *,
+        start: int,
+        end: int | None = None,
+        length: int | None = None,
+    ) -> ReadResult: ...
+
+
+@runtime_checkable
+class GetRangesInto(Protocol):
+    """Batch range read into a caller-provided buffer. The buffer must
+    be at least as large as the sum of the requested range lengths;
+    the wrapper writes each range's bytes into a contiguous slice of
+    the buffer, in input order. The returned ReadResults' `value`
+    fields are memoryviews over the corresponding slices."""
+
+    def get_ranges_into(
+        self,
+        key: str,
+        buffer: "WritableBuffer",
+        *,
+        starts: Sequence[int],
+        ends: Sequence[int] | None = None,
+        lengths: Sequence[int] | None = None,
+    ) -> Sequence[ReadResult]: ...
+
+
+# Async variants follow the same shape with `async def` and `_async`
+# method-name suffixes (`GetIntoAsync`, `GetRangeIntoAsync`,
+# `GetRangesIntoAsync`).
+```
+
+`WritableBuffer` is anything that exposes the *writable* buffer protocol. Concretely: `bytearray`, a writable `memoryview`, `numpy.ndarray` (writable), `cupy.ndarray` via `__cuda_array_interface__`, a `torch.Tensor` via `__cuda_array_interface__` (or `__dlpack__`), an mmap. The protocol does not pin a single concrete type; the conformance suite tests against `bytearray` for the baseline and adds CUDA-array-interface tests for backends that advertise GPU-direct support.
+
+```python
+# zarr/storage/protocols.py (continued)
+
+WritableBuffer = TypeAlias  # the union of supported writable buffer-protocol types
+# In practice: anything where memoryview(b).readonly is False, OR
+# anything with a __cuda_array_interface__ / __dlpack__ exposing a
+# writable region. Spelled out concretely in the runtime check.
+```
+
+### Buffer ownership contract
+
+Three load-bearing rules, all enforceable by the conformance suite:
+
+1. **The buffer is fully caller-owned.** The store does not retain a reference past the return of `get_into`. The store does not free or modify the buffer outside the prefix it writes. This is the inverse of the `Get` contract (where the *store* owns the returned `memoryview`'s backing).
+
+2. **The store writes into the prefix `[0, len(value))` of the buffer.** Bytes past the prefix are untouched. Callers who need to know how many bytes were written read it from the returned `ReadResult.value`'s length, or from the `head()` precheck.
+
+3. **Buffers that are too small raise.** If the value is larger than the buffer, the store raises `ValueError` (or a more specific subclass) before writing. The check happens before any writes; partially-filled buffers on error are not part of the contract. Callers who want truncation semantics use `GetRangeInto` with an explicit `length`.
+
+The "buffer too small" check forces a tradeoff: either every `get_into` call pays a `head()` round-trip first to size the buffer, or the caller tracks sizes out-of-band. The recommended idiom is to use `GetRangeInto` with explicit `start`/`length`, which is precisely sized by definition. `GetInto` is for the case where the caller already knows the value's size (cached metadata, a manifest, prior `head` call).
+
+### Backend support
+
+| Backend | Implements `GetInto`? | Notes |
+|---|---|---|
+| `LocalStore` | yes (read into mmap or buffer via `os.read` into a `bytearray`) | Works for any writable CPU buffer; no special GPU path |
+| `MemoryStore` | yes (memcpy from internal store to caller buffer) | Works for any writable buffer; GPU path requires CUDA-aware copy |
+| `ZipStore` | yes (zipfile.read_into-like, via internal stream) | CPU-only |
+| `FsspecStore` | depends on fs | Most fsspec backends materialize to `bytes`; advertise `GetInto` only if a `read_into` path exists |
+| `ObstoreStore` | not in initial release | obstore's current API allocates; advertise `GetInto` once obstore grows the equivalent |
+| Future GDS-aware obstore | yes (DMA into device buffer when buffer exposes `__cuda_array_interface__`) | The motivating use case |
+| Future `KvikioStore` | yes (kvikio-native; bypasses CPU entirely for `cupy` and similar) | Slot reserved |
+
+Most backends implement `GetInto` as a thin shim around their existing read path: read into a temporary, `memoryview(buffer)[:len] = bytes(temp)`. This is a copy, not zero-copy — the win for these backends is purely API uniformity, not performance. The genuine zero-copy win is reserved for backends that have backend-specific support (mmap into the same address space, GDS DMA, kvikio).
+
+This means **`GetInto` is honest about which backends can actually deliver zero-copy.** The protocol declaration is a load-bearing claim; backends that can only do "read then copy" can either advertise `GetInto` (with the documented copy) or skip it (forcing callers to use `Get` and copy themselves). The conformance suite's `ZeroCopyGetIntoSpec` (separate from the basic `GetIntoSpec`) tests whether the destination buffer is *actually* the memory the backend wrote — not a copy. Backends opt into the zero-copy spec only when they can pass it; the rest stay on the basic spec.
+
+### Composition with wrappers
+
+- **`Caching[GetInto]`**: refused at construction. The cache stores bytes in its own memory; `get_into` wants bytes in the caller's buffer. The cache could memcpy from its store to the caller's buffer, but this defeats the zero-copy motivation of `GetInto`. A user who wants caching of large reads should use `Get` (allocation-based) and accept the cache's memory cost; a user who wants zero-copy should not cache. Refuse-at-construction; document. A future "buffer-aware cache" that holds buffers the caller can borrow is a separate proposal.
+- **`RangeCoalescing[GetRangeInto]`**: works, with the wrapper managing buffer slicing. The wrapper allocates a coalesced-fetch buffer, issues one `get_range_into` for the group, and writes each requested range's bytes into the corresponding slice of the *caller's* output buffer. The intermediate coalesced buffer is the wrapper's; the output buffer is the caller's; one copy at the slice-out step. Zero-copy from network to caller is preserved when the inner `GetRangeInto` is zero-copy and the slice is contiguous; otherwise the slice copy is the price of coalescing. Algorithm sketch in [stores-range-coalescing.md](./stores-range-coalescing.md), pending an updated subsection that addresses this case.
+- **`Transactional[GetInto]`**: orthogonal. `GetInto` is read-side; transactions are write-side. Reads inside a transaction route through `get_into` the same way they route through `get`, with generations tracked the same way.
+- **`ReadOnly[GetInto]`**: passes through. `GetInto` is a read capability; `ReadOnly` does not strip read capabilities.
+- **`Prefixed[GetInto]`**: passes through.
+- **`Tracing[GetInto]`**: works; the span attribute set adds `zarr.store.buffer_kind` (`"cpu"` / `"cuda"` / `"unknown"`) inferred from whether the buffer exposes `__cuda_array_interface__`.
+
+### Conformance
+
+Three new specs land in [stores-conformance.md](./stores-conformance.md):
+
+- **`GetIntoSpec`** parameterizes over backends that satisfy `GetInto`. Asserts that `get_into(key, bytearray(N))` writes the correct bytes; the buffer outside the prefix is untouched; an undersized buffer raises before any writes; the returned `ReadResult.generation` matches what `Get` reports for the same key; nested calls do not interfere.
+- **`GetRangeIntoSpec`** mirrors `GetRangeSpec` with buffer-provided semantics. Asserts that `start`/`end`/`length` route to the correct bytes; that the buffer is sized correctly; that empty ranges yield zero-length writes; that out-of-range requests raise.
+- **`ZeroCopyGetIntoSpec`** is separately opt-in. A backend advertises this spec only when it can guarantee that the destination buffer is the memory the backend wrote, not a copy. The test creates a buffer, calls `get_into`, mutates a byte of the *backend's* internal storage (via a backend-specific hook), and asserts the caller's buffer reflects the change. Backends like `MemoryStore` (where the backend's storage is the caller's buffer if the implementation chooses) and `LocalStore` with mmap can opt in; `FsspecStore` and copy-based backends do not. This spec is what makes "zero-copy" a falsifiable claim.
+
+### Worked examples
+
+```python
+# 1) GPU-direct read into a cupy array (assumes a GDS-aware obstore variant).
+import cupy as cp
+from zarr.storage.stores.obstore import GDSObstoreStore
+
+store: GetInto = GDSObstoreStore(...)
+buf = cp.empty(shard_size, dtype=cp.uint8)
+result = store.get_into("c/0/0", buf)
+# `buf` now holds the shard's bytes on the GPU. No CPU bounce.
+# `result.generation` is the S3 ETag at read time.
+
+# 2) Read directly into a numpy array allocation (CPU).
+import numpy as np
+
+store: GetInto = LocalStore("/data")
+buf = np.empty(metadata_size, dtype=np.uint8)
+result = store.get_into("zarr.json", buf.data)
+# `buf` holds the metadata bytes. The store wrote into numpy's memory.
+
+# 3) Range coalescing into a single GPU buffer.
+import cupy as cp
+from zarr.storage.wrappers import RangeCoalescing
+
+store = RangeCoalescing(GDSObstoreStore(...))
+total = sum(lengths)
+buf = cp.empty(total, dtype=cp.uint8)
+results = store.get_ranges_into(
+    "shard.zarr",
+    buf,
+    starts=starts,
+    lengths=lengths,
+)
+# Each requested range now occupies a contiguous slice of `buf` on the GPU.
+# `results[i].value` is a memoryview over `buf[offset:offset+lengths[i]]`.
+
+# 4) Falling back to allocation when GetInto is unavailable.
+def read(store: Get | GetInto, key: str, hint_size: int | None = None) -> ReadResult:
+    if isinstance(store, GetInto) and hint_size is not None:
+        buf = bytearray(hint_size)
+        return store.get_into(key, buf)
+    return store.get(key)
+# Callers who can size the read up front and have a GetInto-capable
+# backend get the zero-copy path; everyone else gets the allocation path.
+```
+
+### Migration
+
+This subsection's commitments are additive:
+
+- The `GetInto` / `GetRangeInto` / `GetRangesInto` protocols are new.
+- The `prototype: BufferPrototype` argument on existing `Get` methods continues to be deprecated per the [README's decoupling-prototype subsection](../README.md#decoupling-prototype-from-the-read-api).
+- No backend is required to implement `GetInto` in the initial release. The protocol is the *slot* for future GPU-direct-storage backends.
+- `LocalStore` and `MemoryStore` can implement `GetInto` for free (CPU buffer fill); shipping these as the reference implementations validates the protocol shape.
+
+The README's open question on "GPU re-coupling, if it becomes necessary" is resolved by this subsection: `GetInto` *is* the GPU re-coupling, and it is shaped so that the caller (not the store) chooses the device. The README entry can be replaced with a pointer to this section.
+
+### Open questions
+
+- **`WritableBuffer` typing.** The protocol's argument type is informally "anything writable-buffer-protocol-compatible." A precise Python type for this does not exist in the standard library; the closest is `collections.abc.Buffer` (3.12+) but that does not distinguish writable from read-only at the type level. The pragmatic choice is to type the argument as `Any` and rely on a runtime `memoryview(buffer).readonly is False` check, with a separate path for `__cuda_array_interface__` buffers. Worth tracking; not a blocker.
+- **Async `GetInto` and lifetime.** An `await store.get_into_async(key, buf)` call holds a reference to `buf` for the duration of the await. If the caller drops `buf` mid-await, the async call has a dangling reference. The contract has to specify "the caller must keep `buf` alive until the await resolves," which is the standard async-buffer contract but worth documenting explicitly.
+- **`GetInto` over `Caching`.** Refused at construction in the initial design. Whether a "buffer-aware cache" (one that holds buffers callers can borrow) is worth shipping is a future-proposal question. The conservative initial answer is no; revisit if real workloads demand it.
+- **Composition with `Transactional` reads inside `repeatable_read=True` transactions.** The transaction tracks the generation of every read for commit-time conflict detection. `GetInto` reads are reads, so the same tracking applies. Worth confirming in conformance tests; no design change expected.
+- **CPU buffers on copy-based backends.** Most backends implement `GetInto` as "read into temporary, memcpy into caller buffer." This is allocation + copy, strictly worse than `Get` (which is just allocation, since the caller can read the result without copying). Should backends in this category advertise `GetInto` (uniform API, slow path) or skip it (callers fall back to `Get`)? The recommendation is to advertise it: the API uniformity is worth the modest slowdown for callers who want one code path, and callers who care about the perf difference can dispatch on `isinstance(store, ZeroCopyGetIntoSpec)` (or an analogous marker). Decide by initial-release time.
+- **`GetInto` interaction with `MemoryStore`'s internal buffer.** `MemoryStore` stores `memoryview` over `bytes` internally. The `GetInto` implementation can either (a) `memcpy` from internal to caller (CPU-cheap, breaks zero-copy from internal storage), or (b) require the caller's buffer to be the same memory as the internal storage (impossible in general). Pick (a) and document; a backend that wants true zero-copy from in-memory storage is `MemoryStore.get` returning a memoryview over the internal bytes, which is what `Get` already does.
+
 ## Path helpers
 
 ```python
