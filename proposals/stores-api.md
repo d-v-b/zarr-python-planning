@@ -109,13 +109,19 @@ class Transactional(Protocol):
 # See the README's sync-by-default subsection for the per-backend mapping.
 ```
 
-## GPU and zero-copy reads via `GetInto`
+## GPU, zero-copy, and streaming reads via `GetStreaming`
 
-`Get`, `GetRange`, and `GetRanges` follow an allocation-based contract: the store allocates the result buffer, fills it, and returns it. This is the right shape for the common case (CPU reads from CPU-shaped backends) and matches every role-model storage API: TensorStore's `KvStore.read` allocates ([KvStore.read](https://google.github.io/tensorstore/python/api/tensorstore.KvStore.read.html)), zarrs's `ReadableStorageTraits::get` allocates ([ReadableStorageTraits](https://docs.rs/zarrs_storage/latest/zarrs_storage/trait.ReadableStorageTraits.html)), zarrita's `Readable.get` allocates, obstore's `get` allocates.
+`Get`, `GetRange`, and `GetRanges` follow an allocation-based contract: the store allocates the result buffer, fills it, and returns it. This is the right shape for the common case (small CPU reads from CPU-shaped backends) and matches every role-model storage API: TensorStore's `KvStore.read` allocates ([KvStore.read](https://google.github.io/tensorstore/python/api/tensorstore.KvStore.read.html)), zarrs's `ReadableStorageTraits::get` allocates ([ReadableStorageTraits](https://docs.rs/zarrs_storage/latest/zarrs_storage/trait.ReadableStorageTraits.html)), zarrita's `Readable.get` allocates, obstore's `get` allocates.
 
-But the allocation-based contract leaves zero-copy GPU-direct reads on the table. Today's `prototype: BufferPrototype` argument was an attempt to address this — by letting the caller specify "give me back a GPU buffer" — but the README's [decoupling-prototype subsection](../README.md#decoupling-prototype-from-the-read-api) admits the GPU path is fictional in current zarr-python: even with `gpu_buffer_prototype`, the bytes hit the CPU first because neither fsspec nor obstore knows how to allocate on the device. `prototype` is a knob that doesn't actually wire up.
+But the allocation-based contract leaves three problems on the table:
 
-The honest design is to push buffer ownership to the *caller* via a `GetInto` protocol family. The caller allocates the destination buffer (CPU or GPU); the store writes into it. Backends that can DMA directly into device memory (a future GDS-aware obstore, a kvikio-backed store) advertise `GetInto`; backends that can't simply don't advertise it. Callers who need GPU-direct-storage ask for `GetInto` at the type level; everyone else uses the allocation-based `Get`.
+1. **GPU-direct reads.** Today's `prototype: BufferPrototype` argument was an attempt to address this — by letting the caller specify "give me back a GPU buffer" — but the README's [decoupling-prototype subsection](../README.md#decoupling-prototype-from-the-read-api) admits the GPU path is fictional in current zarr-python: even with `gpu_buffer_prototype`, the bytes hit the CPU first because neither fsspec nor obstore knows how to allocate on the device. `prototype` is a knob that doesn't actually wire up.
+2. **Values that exceed memory.** A 100 GiB shard cannot be read into a `bytes`/`memoryview` in one shot. The current API forces the caller to use `GetRange` to manually pull slice-by-slice, which is awkward and loses any pipelining benefit the backend could offer.
+3. **Pipelined decode.** A network read of a multi-MiB shard delivers bytes incrementally over hundreds of milliseconds. The codec pipeline could start decoding the first chunk while the last chunk is still in flight. The one-shot `Get` blocks the caller from any of this; today's zarr-python collects the full payload before any downstream code runs.
+
+The honest design that addresses all three is a streaming protocol where the caller provides the destination buffer (CPU or GPU) and pumps chunks through. This is the shape zstd's streaming API takes ([zstd manual](https://facebook.github.io/zstd/zstd_manual.html), `ZSTD_decompressStream`): both ends are caller-owned, both have explicit cursors, the callee advances both. It is also the shape Python's `io.RawIOBase.readinto` takes for in-process streams.
+
+We adopt it for stores: `GetStreaming` returns a `ReadStream` that the caller drains chunk-by-chunk into a writable buffer. A `read_full(key, buffer)` convenience covers the one-shot case (caller knows the size up front) without duplicating the protocol family.
 
 This is opt-in additive surface alongside `Get`, not a replacement.
 
@@ -125,65 +131,149 @@ This is opt-in additive surface alongside `Get`, not a replacement.
 # zarr/storage/protocols.py (continued)
 
 @runtime_checkable
-class GetInto(Protocol):
-    """Read into a caller-provided writable buffer. The buffer must be
-    at least as large as the value; the store fills it and returns a
-    ReadResult whose `value` is a memoryview over the prefix of the
-    buffer that was filled. The generation is reported the same way
-    `Get` reports it.
+class GetStreaming(Protocol):
+    """Open a streaming read. Returns a `ReadStream` whose `read_into`
+    method the caller calls repeatedly to drain chunks into a
+    caller-provided writable buffer.
+
+    Backends that hold open a connection or file handle for the
+    duration of the read implement this directly (HTTP chunked
+    transfer, S3 streaming GET, file handle, mmap region). The
+    backend owns connection lifetime via the stream's context-manager
+    protocol; the caller owns the destination buffer.
 
     Backends that can DMA directly into the destination buffer
     (CUDA-aware HTTP, NVIDIA GDS, kvikio-backed storage) avoid the
     intermediate CPU buffer entirely. Backends without that capability
-    do not implement this protocol; callers who want zero-copy GPU
-    reads use the type system to require `GetInto` and get a clear
-    type error when a backend that cannot deliver is passed in."""
+    fall back to read-then-copy at the FFI boundary; the protocol is
+    honest about which path each backend takes via the
+    `ZeroCopyGetStreamingSpec` (see Conformance).
 
-    def get_into(self, key: str, buffer: "WritableBuffer") -> ReadResult: ...
+    The one-shot read pattern is `stream.read_full(buffer)`, which
+    fills the buffer in a single drain and raises if the value is
+    larger. This subsumes the simpler GetInto protocol earlier
+    drafts proposed."""
+
+    def get_streaming(self, key: str) -> "ReadStream": ...
 
 
 @runtime_checkable
-class GetRangeInto(Protocol):
-    def get_range_into(
+class GetRangeStreaming(Protocol):
+    def get_range_streaming(
         self,
         key: str,
-        buffer: "WritableBuffer",
         *,
         start: int,
         end: int | None = None,
         length: int | None = None,
-    ) -> ReadResult: ...
+    ) -> "ReadStream": ...
 
 
 @runtime_checkable
-class GetRangesInto(Protocol):
-    """Batch range read into a caller-provided buffer. The buffer must
-    be at least as large as the sum of the requested range lengths;
-    the wrapper writes each range's bytes into a contiguous slice of
-    the buffer, in input order. The returned ReadResults' `value`
-    fields are memoryviews over the corresponding slices."""
+class GetRangesStreaming(Protocol):
+    """Batch streaming range read. Returns one ReadStream per range
+    (in input order), or a single multiplexed ReadStream that
+    demultiplexes per-range when drained. The latter is the
+    `RangeCoalescing` wrapper's preferred shape because one
+    underlying connection serves all ranges; see [stores-range-coalescing.md](./stores-range-coalescing.md)."""
 
-    def get_ranges_into(
+    def get_ranges_streaming(
         self,
         key: str,
-        buffer: "WritableBuffer",
         *,
         starts: Sequence[int],
         ends: Sequence[int] | None = None,
         lengths: Sequence[int] | None = None,
-    ) -> Sequence[ReadResult]: ...
+    ) -> Sequence["ReadStream"]: ...
 
 
-# Async variants follow the same shape with `async def` and `_async`
-# method-name suffixes (`GetIntoAsync`, `GetRangeIntoAsync`,
-# `GetRangesIntoAsync`).
+# Async variants follow the same shape with `async def`, `_async`
+# method-name suffixes (`GetStreamingAsync`, `GetRangeStreamingAsync`,
+# `GetRangesStreamingAsync`), and an `AsyncReadStream` whose
+# `read_into_async` returns an awaitable.
 ```
 
-`WritableBuffer` is anything that exposes the *writable* buffer protocol. Concretely: `bytearray`, a writable `memoryview`, `numpy.ndarray` (writable), `cupy.ndarray` via `__cuda_array_interface__`, a `torch.Tensor` via `__cuda_array_interface__` (or `__dlpack__`), an mmap. The protocol does not pin a single concrete type; the conformance suite tests against `bytearray` for the baseline and adds CUDA-array-interface tests for backends that advertise GPU-direct support.
+### `ReadStream`
 
 ```python
-# zarr/storage/protocols.py (continued)
+class ReadStream:
+    """Stateful streaming-read handle. Holds a connection, file
+    descriptor, or cursor. Use as a context manager to ensure cleanup
+    (network sockets, file handles, mmap regions all need explicit
+    release).
 
+    Modeled on Python's `io.RawIOBase` plus a generation field, with
+    the `readinto`-shaped contract: each call writes into a
+    caller-provided buffer and returns the number of bytes written;
+    zero means end of stream."""
+
+    @property
+    def generation(self) -> "Generation | None":
+        """The value's generation, captured at stream open. Stable
+        for the lifetime of the stream. Calls to `read_into` after
+        the stream is opened do not change this value; if the
+        underlying object changes mid-stream, the backend either
+        raises (preferred, for backends that detect it) or silently
+        delivers stale bytes (documented for backends that cannot)."""
+
+    @property
+    def total_size(self) -> int | None:
+        """The total size of the stream's value, if known up front.
+        None for backends that don't know (HTTP without
+        Content-Length). Callers can use this to size scratch buffers
+        appropriately for `read_full`-style consumption."""
+
+    def read_into(self, buffer: "WritableBuffer") -> int:
+        """Read up to `len(buffer)` bytes into `buffer`, starting at
+        offset 0. Returns the number of bytes written. Returns 0 at
+        end-of-stream.
+
+        The buffer must expose the writable buffer protocol (see
+        WritableBuffer). The store writes into the prefix
+        `[0, returned_count)`; bytes past the prefix are untouched."""
+
+    def read_full(self, buffer: "WritableBuffer") -> int:
+        """Drain the entire remaining stream into `buffer`. Returns
+        the total bytes written.
+
+        Raises ValueError if the stream's remaining size exceeds the
+        buffer (no partial fill on this contract — partial fill is
+        the job of `read_into`).
+
+        This is the one-shot convenience that covers the common case
+        of "I know the size up front, give me the bytes."""
+
+    @property
+    def closed(self) -> bool: ...
+
+    def close(self) -> None:
+        """Release any held resources. Idempotent. After close,
+        further `read_into` raises."""
+
+    def __enter__(self) -> "Self": ...
+    def __exit__(self, *exc) -> None: ...
+
+
+class AsyncReadStream:
+    """Async variant. Same shape with `async def` on read_into / read_full,
+    `__aenter__` / `__aexit__` for context-manager use."""
+
+    @property
+    def generation(self) -> "Generation | None": ...
+    @property
+    def total_size(self) -> int | None: ...
+
+    async def read_into_async(self, buffer: "WritableBuffer") -> int: ...
+    async def read_full_async(self, buffer: "WritableBuffer") -> int: ...
+
+    async def aclose(self) -> None: ...
+    async def __aenter__(self) -> "Self": ...
+    async def __aexit__(self, *exc) -> None: ...
+```
+
+`WritableBuffer` is anything that exposes the *writable* buffer protocol. Concretely: `bytearray`, a writable `memoryview`, `numpy.ndarray` (writable), `cupy.ndarray` via `__cuda_array_interface__`, a `torch.Tensor` via `__cuda_array_interface__` or `__dlpack__`, an mmap. The protocol does not pin a single concrete type; the conformance suite tests against `bytearray` for the baseline and adds CUDA-array-interface tests for backends that advertise GPU-direct support.
+
+```python
 WritableBuffer = TypeAlias  # the union of supported writable buffer-protocol types
 # In practice: anything where memoryview(b).readonly is False, OR
 # anything with a __cuda_array_interface__ / __dlpack__ exposing a
@@ -192,48 +282,124 @@ WritableBuffer = TypeAlias  # the union of supported writable buffer-protocol ty
 
 ### Buffer ownership contract
 
-Three load-bearing rules, all enforceable by the conformance suite:
+Five rules, all enforceable by the conformance suite:
 
-1. **The buffer is fully caller-owned.** The store does not retain a reference past the return of `get_into`. The store does not free or modify the buffer outside the prefix it writes. This is the inverse of the `Get` contract (where the *store* owns the returned `memoryview`'s backing).
+1. **The buffer is fully caller-owned.** The store does not retain a reference past the return of `read_into` / `read_full`. The store does not free or modify the buffer outside the prefix it writes. This is the inverse of the `Get` contract (where the *store* owns the returned `memoryview`'s backing).
 
-2. **The store writes into the prefix `[0, len(value))` of the buffer.** Bytes past the prefix are untouched. Callers who need to know how many bytes were written read it from the returned `ReadResult.value`'s length, or from the `head()` precheck.
+2. **`read_into` writes into the prefix `[0, returned_count)` of the buffer.** Bytes past `returned_count` are untouched. The caller learns how many bytes were written from the return value, not from the buffer length.
 
-3. **Buffers that are too small raise.** If the value is larger than the buffer, the store raises `ValueError` (or a more specific subclass) before writing. The check happens before any writes; partially-filled buffers on error are not part of the contract. Callers who want truncation semantics use `GetRangeInto` with an explicit `length`.
+3. **`read_into` may write fewer bytes than the buffer size.** A short return is *not* end-of-stream — only a zero return means EOS. Callers must loop until they see zero. (This matches `os.read` and `io.RawIOBase.readinto` exactly; the contract is well-known.)
 
-The "buffer too small" check forces a tradeoff: either every `get_into` call pays a `head()` round-trip first to size the buffer, or the caller tracks sizes out-of-band. The recommended idiom is to use `GetRangeInto` with explicit `start`/`length`, which is precisely sized by definition. `GetInto` is for the case where the caller already knows the value's size (cached metadata, a manifest, prior `head` call).
+4. **`read_full` raises `ValueError` if the stream's remaining bytes exceed the buffer.** No partial fill on `read_full`; partial fill is what `read_into` is for.
+
+5. **The stream must be closed.** Either via context manager (`with` / `async with`) or explicit `close()`. Failing to close leaks the underlying connection / file handle. The conformance suite asserts that `close()` is idempotent and that double-close does not raise.
+
+The contract is unambiguous about EOS: zero bytes returned from `read_into` means the stream is exhausted. Backends that have a `total_size` available expose it for callers who want to size scratch buffers up front; backends that don't (HTTP without Content-Length, chunked transfer encodings) leave it as `None`.
+
+### One-shot via `read_full`
+
+The earlier draft's `GetInto` protocol family (`GetInto`, `GetRangeInto`, `GetRangesInto`) is fully subsumed by `read_full`:
+
+```python
+# Earlier draft:
+result = store.get_into("zarr.json", buf)
+
+# This proposal:
+with store.get_streaming("zarr.json") as stream:
+    n = stream.read_full(buf)
+    # buf[:n] holds the value; result.generation is stream.generation
+```
+
+The slight syntactic overhead (one extra line for the context manager) buys uniform handling of small and large reads. Callers who want a `get_into`-style convenience can wrap once:
+
+```python
+def get_into(store: GetStreaming, key: str, buffer: WritableBuffer) -> ReadResult:
+    with store.get_streaming(key) as stream:
+        n = stream.read_full(buffer)
+        return ReadResult(value=memoryview(buffer)[:n], generation=stream.generation)
+```
+
+This helper lives in `zarr.storage.helpers` for callers who don't want to manage streams. Behind it, every read is a stream; the one-shot interface is just sugar.
+
+### Streaming for values larger than memory
+
+```python
+# Stream a 100 GiB shard through a 1 MiB scratch buffer.
+buf = bytearray(1 << 20)
+with store.get_streaming("huge-shard") as stream:
+    while True:
+        n = stream.read_into(buf)
+        if n == 0:
+            break
+        consume(buf[:n])
+# Total memory used: 1 MiB. No need to materialize the whole value.
+```
+
+This is the load-bearing case the one-shot `GetInto` could not handle. Combined with codec-pipeline streaming (a separate proposal), it lets zarr-python read shards that don't fit in memory.
+
+### Streaming for pipelined decode
+
+```python
+# Decode chunks as they arrive from the network.
+buf = bytearray(1 << 20)
+decoder = ChunkDecoder(...)
+with store.get_streaming("shard.zarr") as stream:
+    while True:
+        n = stream.read_into(buf)
+        if n == 0:
+            break
+        decoder.feed(buf[:n])  # decoder emits chunks as boundaries are crossed
+for chunk in decoder.flush():
+    process(chunk)
+```
+
+The decoder works on bytes as they arrive. End-to-end latency drops from "network full delivery + decode time" to "first chunk arrival + per-chunk decode time." This is what zarrs and TensorStore do internally; exposing it at the store layer in zarr-python lets the array/codec layers take advantage.
+
+### GPU-direct reads via streaming
+
+```python
+import cupy as cp
+
+buf = cp.empty(shard_size, dtype=cp.uint8)
+with gds_store.get_streaming("c/0/0") as stream:
+    n = stream.read_full(buf)
+# The bytes were DMA'd directly into GPU memory. No CPU bounce.
+```
+
+The protocol is unchanged from the CPU case; only the buffer's memory location differs. The backend (a future GDS-aware obstore variant) detects the CUDA buffer via `__cuda_array_interface__` and uses the device-direct path; backends that can't fall back to "read into temp, memcpy into caller buffer" with the documented copy.
 
 ### Backend support
 
-| Backend | Implements `GetInto`? | Notes |
+| Backend | Implements `GetStreaming`? | Notes |
 |---|---|---|
-| `LocalStore` | yes (read into mmap or buffer via `os.read` into a `bytearray`) | Works for any writable CPU buffer; no special GPU path |
-| `MemoryStore` | yes (memcpy from internal store to caller buffer) | Works for any writable buffer; GPU path requires CUDA-aware copy |
-| `ZipStore` | yes (zipfile.read_into-like, via internal stream) | CPU-only |
-| `FsspecStore` | depends on fs | Most fsspec backends materialize to `bytes`; advertise `GetInto` only if a `read_into` path exists |
-| `ObstoreStore` | not in initial release | obstore's current API allocates; advertise `GetInto` once obstore grows the equivalent |
-| Future GDS-aware obstore | yes (DMA into device buffer when buffer exposes `__cuda_array_interface__`) | The motivating use case |
+| `LocalStore` | yes (open file handle, `os.read` into buffer) | Trivial; no special GPU path |
+| `MemoryStore` | yes (memoryview slice over internal bytes) | Stream is a thin cursor; closes are no-op |
+| `ZipStore` | yes (`zipfile.ZipFile.open(...)` returns a stream) | CPU-only |
+| `FsspecStore` | yes when fs supports it | Most async fsspec backends expose a streaming Body; sync fsspec backends often allocate. Per-fs |
+| `ObstoreStore` | yes (obstore exposes a streaming Body via `get_async`) | Existing API maps directly |
+| Future GDS-aware obstore | yes (DMA into device buffer when buffer exposes `__cuda_array_interface__`) | The motivating GPU use case |
 | Future `KvikioStore` | yes (kvikio-native; bypasses CPU entirely for `cupy` and similar) | Slot reserved |
 
-Most backends implement `GetInto` as a thin shim around their existing read path: read into a temporary, `memoryview(buffer)[:len] = bytes(temp)`. This is a copy, not zero-copy — the win for these backends is purely API uniformity, not performance. The genuine zero-copy win is reserved for backends that have backend-specific support (mmap into the same address space, GDS DMA, kvikio).
+`MemoryStore` and `LocalStore` (without mmap) implement `read_into` as a memcpy from internal storage to caller buffer; this is API-uniform with the network case but does not deliver zero-copy from the backend's storage. Backends opt into the conformance suite's `ZeroCopyGetStreamingSpec` (see below) only when they can pass it.
 
-This means **`GetInto` is honest about which backends can actually deliver zero-copy.** The protocol declaration is a load-bearing claim; backends that can only do "read then copy" can either advertise `GetInto` (with the documented copy) or skip it (forcing callers to use `Get` and copy themselves). The conformance suite's `ZeroCopyGetIntoSpec` (separate from the basic `GetIntoSpec`) tests whether the destination buffer is *actually* the memory the backend wrote — not a copy. Backends opt into the zero-copy spec only when they can pass it; the rest stay on the basic spec.
+Network backends (`ObstoreStore`, async `FsspecStore` over HTTP / S3 / GCS / Azure) are the ones that gain the most from the streaming surface: they get pipelined delivery instead of allocate-and-block, which is the pipelined-decode payoff.
 
 ### Composition with wrappers
 
-- **`Caching[GetInto]`**: refused at construction. The cache stores bytes in its own memory; `get_into` wants bytes in the caller's buffer. The cache could memcpy from its store to the caller's buffer, but this defeats the zero-copy motivation of `GetInto`. A user who wants caching of large reads should use `Get` (allocation-based) and accept the cache's memory cost; a user who wants zero-copy should not cache. Refuse-at-construction; document. A future "buffer-aware cache" that holds buffers the caller can borrow is a separate proposal.
-- **`RangeCoalescing[GetRangeInto]`**: works, with the wrapper managing buffer slicing. The wrapper allocates a coalesced-fetch buffer, issues one `get_range_into` for the group, and writes each requested range's bytes into the corresponding slice of the *caller's* output buffer. The intermediate coalesced buffer is the wrapper's; the output buffer is the caller's; one copy at the slice-out step. Zero-copy from network to caller is preserved when the inner `GetRangeInto` is zero-copy and the slice is contiguous; otherwise the slice copy is the price of coalescing. Algorithm sketch in [stores-range-coalescing.md](./stores-range-coalescing.md), pending an updated subsection that addresses this case.
-- **`Transactional[GetInto]`**: orthogonal. `GetInto` is read-side; transactions are write-side. Reads inside a transaction route through `get_into` the same way they route through `get`, with generations tracked the same way.
-- **`ReadOnly[GetInto]`**: passes through. `GetInto` is a read capability; `ReadOnly` does not strip read capabilities.
-- **`Prefixed[GetInto]`**: passes through.
-- **`Tracing[GetInto]`**: works; the span attribute set adds `zarr.store.buffer_kind` (`"cpu"` / `"cuda"` / `"unknown"`) inferred from whether the buffer exposes `__cuda_array_interface__`.
+- **`Caching[GetStreaming]`**: works, with the cache capturing bytes as they flow through. The cache wraps `read_into` to write each chunk into both the caller's buffer and a cache-side buffer; on completion, the captured bytes are committed as a cache entry keyed by `(key,)`. Subsequent reads of the same key serve from the cache via `MemoryStore`-like streaming. This is the streaming-cache pattern; the [caching proposal](./stores-caching.md) is updated to reflect it. The earlier "Caching × GetInto refused at construction" decision is *resolved* here: streaming stores let the cache capture incrementally without breaking zero-copy.
+- **`RangeCoalescing[GetRangeStreaming]`**: works, with the wrapper opening one underlying stream against the coalesced byte range and demultiplexing per-range slices to caller-provided buffers as they arrive. The wrapper's `get_ranges_streaming` returns a `Sequence[ReadStream]`; each per-range stream draws from the shared underlying stream's buffer in offset order. This is genuinely more efficient than the one-shot version for sharded reads from cloud storage — the caller can start decoding the first range's chunks before the last range's bytes have arrived. Algorithm sketch in [stores-range-coalescing.md](./stores-range-coalescing.md), pending an updated subsection.
+- **`Transactional[GetStreaming]`**: orthogonal. `GetStreaming` is read-side; transactions are write-side. Reads inside a transaction stream the same way they do outside. Generations recorded on stream open, not on each `read_into` call.
+- **`ReadOnly[GetStreaming]`**: passes through. `GetStreaming` is a read capability; `ReadOnly` does not strip read capabilities.
+- **`Prefixed[GetStreaming]`**: passes through.
+- **`Tracing[GetStreaming]`**: works; one span per `get_streaming(key)` call covering the entire stream lifetime, with attributes for total bytes consumed, number of `read_into` calls, and time-to-first-byte. The span attribute set adds `zarr.store.buffer_kind` (`"cpu"` / `"cuda"` / `"unknown"`) inferred from whether the buffer exposes `__cuda_array_interface__`.
 
 ### Conformance
 
 Three new specs land in [stores-conformance.md](./stores-conformance.md):
 
-- **`GetIntoSpec`** parameterizes over backends that satisfy `GetInto`. Asserts that `get_into(key, bytearray(N))` writes the correct bytes; the buffer outside the prefix is untouched; an undersized buffer raises before any writes; the returned `ReadResult.generation` matches what `Get` reports for the same key; nested calls do not interfere.
-- **`GetRangeIntoSpec`** mirrors `GetRangeSpec` with buffer-provided semantics. Asserts that `start`/`end`/`length` route to the correct bytes; that the buffer is sized correctly; that empty ranges yield zero-length writes; that out-of-range requests raise.
-- **`ZeroCopyGetIntoSpec`** is separately opt-in. A backend advertises this spec only when it can guarantee that the destination buffer is the memory the backend wrote, not a copy. The test creates a buffer, calls `get_into`, mutates a byte of the *backend's* internal storage (via a backend-specific hook), and asserts the caller's buffer reflects the change. Backends like `MemoryStore` (where the backend's storage is the caller's buffer if the implementation chooses) and `LocalStore` with mmap can opt in; `FsspecStore` and copy-based backends do not. This spec is what makes "zero-copy" a falsifiable claim.
+- **`GetStreamingSpec`** parameterizes over backends that satisfy `GetStreaming`. Asserts that draining a stream produces the same bytes as `Get` would; `read_into` returns 0 at EOS; `read_into` may return less than the buffer size and that's not EOS; `read_full` raises if the buffer is too small; the stream is properly closed via context manager; `total_size` matches the value's actual size when reported; `generation` is stable across calls within a single stream.
+- **`GetRangeStreamingSpec`** mirrors `GetRangeSpec` with streaming semantics. Asserts that `start`/`end`/`length` route to the correct byte range; that the stream is exactly that long; that empty ranges yield zero-length streams; that out-of-range requests raise on stream open (not on first `read_into`).
+- **`ZeroCopyGetStreamingSpec`** is separately opt-in. A backend advertises this spec only when it can guarantee that the destination buffer is the memory the backend wrote, not a copy. The test creates a buffer, drains a stream into it, mutates a byte of the *backend's* internal storage (via a backend-specific hook), and asserts the caller's buffer reflects the change. Backends like `MemoryStore` (where the backend's storage can be the caller's buffer) and `LocalStore` with mmap can opt in; `FsspecStore` and copy-based backends do not. This spec is what makes "zero-copy" a falsifiable claim.
 
 ### Worked examples
 
@@ -242,65 +408,86 @@ Three new specs land in [stores-conformance.md](./stores-conformance.md):
 import cupy as cp
 from zarr.storage.stores.obstore import GDSObstoreStore
 
-store: GetInto = GDSObstoreStore(...)
+store: GetStreaming = GDSObstoreStore(...)
 buf = cp.empty(shard_size, dtype=cp.uint8)
-result = store.get_into("c/0/0", buf)
-# `buf` now holds the shard's bytes on the GPU. No CPU bounce.
-# `result.generation` is the S3 ETag at read time.
+with store.get_streaming("c/0/0") as stream:
+    n = stream.read_full(buf)
+# `buf` holds the shard's bytes on the GPU. No CPU bounce.
+# `stream.generation` is the S3 ETag at read time.
 
-# 2) Read directly into a numpy array allocation (CPU).
-import numpy as np
+# 2) Stream a value larger than memory through a 1 MiB scratch buffer.
+buf = bytearray(1 << 20)
+total = 0
+with store.get_streaming("huge-shard") as stream:
+    while True:
+        n = stream.read_into(buf)
+        if n == 0:
+            break
+        process(buf[:n])
+        total += n
 
-store: GetInto = LocalStore("/data")
-buf = np.empty(metadata_size, dtype=np.uint8)
-result = store.get_into("zarr.json", buf.data)
-# `buf` holds the metadata bytes. The store wrote into numpy's memory.
+# 3) Pipelined decode of a sharded array.
+buf = bytearray(4 << 20)
+decoder = ShardDecoder(...)
+with store.get_streaming("shard.zarr") as stream:
+    while True:
+        n = stream.read_into(buf)
+        if n == 0:
+            break
+        decoder.feed(buf[:n])
+for chunk in decoder.finish():
+    yield chunk
+# Time-to-first-chunk is bounded by network TTFB + decode of the first
+# chunk's bytes, not by full shard delivery.
 
-# 3) Range coalescing into a single GPU buffer.
-import cupy as cp
+# 4) One-shot read of metadata via the read_full convenience.
+buf = bytearray(metadata_size)  # size known from prior head() or schema
+with store.get_streaming("zarr.json") as stream:
+    stream.read_full(buf)
+# `buf` holds the metadata. Functionally equivalent to the one-shot
+# get_into() form from the earlier draft.
+
+# 5) Range-coalesced streaming read of multiple chunks from a shard.
 from zarr.storage.wrappers import RangeCoalescing
 
 store = RangeCoalescing(GDSObstoreStore(...))
-total = sum(lengths)
-buf = cp.empty(total, dtype=cp.uint8)
-results = store.get_ranges_into(
+streams = store.get_ranges_streaming(
     "shard.zarr",
-    buf,
     starts=starts,
     lengths=lengths,
 )
-# Each requested range now occupies a contiguous slice of `buf` on the GPU.
-# `results[i].value` is a memoryview over `buf[offset:offset+lengths[i]]`.
-
-# 4) Falling back to allocation when GetInto is unavailable.
-def read(store: Get | GetInto, key: str, hint_size: int | None = None) -> ReadResult:
-    if isinstance(store, GetInto) and hint_size is not None:
-        buf = bytearray(hint_size)
-        return store.get_into(key, buf)
-    return store.get(key)
-# Callers who can size the read up front and have a GetInto-capable
-# backend get the zero-copy path; everyone else gets the allocation path.
+# Each stream draws from a shared coalesced underlying stream. Drain
+# them in order; the wrapper handles fan-out from the shared buffer.
+for stream, target in zip(streams, target_buffers):
+    with stream:
+        stream.read_full(target)
 ```
 
 ### Migration
 
 This subsection's commitments are additive:
 
-- The `GetInto` / `GetRangeInto` / `GetRangesInto` protocols are new.
+- The `GetStreaming` / `GetRangeStreaming` / `GetRangesStreaming` protocols are new.
+- `ReadStream` is a new class.
 - The `prototype: BufferPrototype` argument on existing `Get` methods continues to be deprecated per the [README's decoupling-prototype subsection](../README.md#decoupling-prototype-from-the-read-api).
-- No backend is required to implement `GetInto` in the initial release. The protocol is the *slot* for future GPU-direct-storage backends.
-- `LocalStore` and `MemoryStore` can implement `GetInto` for free (CPU buffer fill); shipping these as the reference implementations validates the protocol shape.
+- No backend is required to implement `GetStreaming` in the initial release. The protocol is the slot for streaming-capable backends.
+- `LocalStore` and `MemoryStore` can implement `GetStreaming` for free (open file handle, slice over internal bytes); shipping these as the reference implementations validates the protocol shape.
+- `ObstoreStore` and async-fsspec backends are the ones that benefit most; their existing streaming APIs map directly onto `read_into`.
 
-The README's open question on "GPU re-coupling, if it becomes necessary" is resolved by this subsection: `GetInto` *is* the GPU re-coupling, and it is shaped so that the caller (not the store) chooses the device. The README entry can be replaced with a pointer to this section.
+The README's open question on "GPU re-coupling, if it becomes necessary" is resolved by this subsection: `GetStreaming` *is* the GPU re-coupling, and it is shaped so that the caller (not the store) chooses the device. The README entry can be replaced with a pointer to this section.
+
+The earlier draft's `GetInto` / `GetRangeInto` / `GetRangesInto` protocol family is *replaced* by `GetStreaming` plus the `read_full` convenience. The one-shot semantics are preserved (a `with stream: stream.read_full(buf)` is a `get_into`); only the protocol's name and shape change.
 
 ### Open questions
 
 - **`WritableBuffer` typing.** The protocol's argument type is informally "anything writable-buffer-protocol-compatible." A precise Python type for this does not exist in the standard library; the closest is `collections.abc.Buffer` (3.12+) but that does not distinguish writable from read-only at the type level. The pragmatic choice is to type the argument as `Any` and rely on a runtime `memoryview(buffer).readonly is False` check, with a separate path for `__cuda_array_interface__` buffers. Worth tracking; not a blocker.
-- **Async `GetInto` and lifetime.** An `await store.get_into_async(key, buf)` call holds a reference to `buf` for the duration of the await. If the caller drops `buf` mid-await, the async call has a dangling reference. The contract has to specify "the caller must keep `buf` alive until the await resolves," which is the standard async-buffer contract but worth documenting explicitly.
-- **`GetInto` over `Caching`.** Refused at construction in the initial design. Whether a "buffer-aware cache" (one that holds buffers callers can borrow) is worth shipping is a future-proposal question. The conservative initial answer is no; revisit if real workloads demand it.
-- **Composition with `Transactional` reads inside `repeatable_read=True` transactions.** The transaction tracks the generation of every read for commit-time conflict detection. `GetInto` reads are reads, so the same tracking applies. Worth confirming in conformance tests; no design change expected.
-- **CPU buffers on copy-based backends.** Most backends implement `GetInto` as "read into temporary, memcpy into caller buffer." This is allocation + copy, strictly worse than `Get` (which is just allocation, since the caller can read the result without copying). Should backends in this category advertise `GetInto` (uniform API, slow path) or skip it (callers fall back to `Get`)? The recommendation is to advertise it: the API uniformity is worth the modest slowdown for callers who want one code path, and callers who care about the perf difference can dispatch on `isinstance(store, ZeroCopyGetIntoSpec)` (or an analogous marker). Decide by initial-release time.
-- **`GetInto` interaction with `MemoryStore`'s internal buffer.** `MemoryStore` stores `memoryview` over `bytes` internally. The `GetInto` implementation can either (a) `memcpy` from internal to caller (CPU-cheap, breaks zero-copy from internal storage), or (b) require the caller's buffer to be the same memory as the internal storage (impossible in general). Pick (a) and document; a backend that wants true zero-copy from in-memory storage is `MemoryStore.get` returning a memoryview over the internal bytes, which is what `Get` already does.
+- **Stream lifetime under async cancellation.** An `async with stream:` block that is cancelled mid-drain should release the underlying connection cleanly. Most async backends handle this via `__aexit__`, but partial reads on cancellation are a contract worth pinning: the buffer's prefix is whatever was drained before cancellation, and the stream is closed. Document explicitly.
+- **`total_size=None` semantics.** Backends that don't know the total size up front (HTTP without Content-Length, chunked transfer) leave `total_size` as None. Callers who want to call `read_full` with a sized buffer have to either know the size from elsewhere (manifest, prior `head()`) or use `read_into` in a loop. This is unavoidable; the protocol cannot synthesize a size the backend doesn't know.
+- **Generation stability mid-stream.** The contract says `generation` is stable for the lifetime of the stream. Backends that detect mid-stream changes (HTTP `If-Match` failure, S3 ETag drift) should raise rather than deliver inconsistent bytes. Backends that cannot detect (fsspec over a backend without versioning) document the limitation. Worth a per-backend audit.
+- **`Caching[GetStreaming]` cache-fill correctness.** The streaming-cache pattern captures bytes into a cache entry as they flow through. If the caller drops the stream mid-drain, the cache entry is incomplete and must not be served on subsequent reads. The cache wrapper marks entries as "in progress" until the stream closes successfully; partial entries are discarded. Detailed in the [caching proposal](./stores-caching.md), pending update.
+- **Pipelined decode integration.** The streaming surface is necessary but not sufficient for pipelined decode; the codec pipeline also has to be streaming-capable. That work belongs in the [Codecs section of the README](../README.md#codecs). The store-layer protocol is shipped first; codec adoption follows.
+- **Backwards-compatible shim.** During the migration window, the existing `Buffer`-returning `Get.get` methods can be implemented in terms of `GetStreaming` (open stream, read_full into a bytearray, wrap as Buffer). This means a backend can ship `GetStreaming` first and get the legacy surface for free. Worth flagging as the recommended migration order.
+- **Cursor-style alternative for local backends.** A `GetIntoStreaming` protocol with explicit `(buffer, source_offset, dest_offset)` cursors would suit local-only backends (LocalStore, MemoryStore) better than the stateful `ReadStream`, because there's no connection to hold open. Stays open as a future addition if a real performance gap emerges; the stream-with-trivial-state pattern is fine for v1.
 
 ## Path helpers
 
