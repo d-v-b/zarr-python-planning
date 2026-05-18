@@ -53,7 +53,7 @@ The end state is that `Array.__getitem__` *itself* returns a lazy view. We get t
 
 - **In 4.0**, `Array` grows an opt-in accessor — `array.lazy[...]` (working name; the actual name is settled in the migration PR). The accessor's `__getitem__` returns an array view bound to the source `Array` plus a composed selection. The bare `array[...]` keeps its existing eager-NumPy behavior; users opt in by going through the accessor.
 - **In a later 4.x release**, `Array.__getitem__` itself flips to return the same view object the accessor returns. The accessor stays as an unambiguous explicit form but becomes a no-op (`array.lazy[...]` and `array[...]` behave identically).
-- **In 5.0**, the eager path is gone and so is the need for the accessor; `Array.__getitem__` is the only path.
+- **In a future major release** (after the deprecation window completes), the eager path is gone and so is the need for the accessor; `Array.__getitem__` is the only path.
 
 There is never a `LazyArray` class. There is never a period where downstream code has to handle two array types via `isinstance` checks. The change rides on a single type whose `__getitem__` semantics evolve across releases — the same pattern `pathlib.Path` used to absorb `os.path` behaviors without introducing a parallel type.
 
@@ -162,7 +162,7 @@ The transition is staged. No new array *type* is ever introduced; the migration 
 
 1. **4.0**: ship the foundational `IndexTransform` algebra ([zarr#3906](https://github.com/zarr-developers/zarr-python/pull/3906)) and the `array.lazy[...]` accessor. The accessor's `__getitem__` returns a lazy view bound to the source `Array`. The bare `array[...]` keeps its existing eager-NumPy behavior. Users opt in by going through the accessor; no downstream code breaks. A deprecation warning starts firing on bare `array[...]` calls in cases where the lazy form would be preferable, pointing users at the accessor.
 2. **4.x**: flip the default of `Array.__getitem__` to lazy. The `array.lazy[...]` accessor stays as an unambiguous explicit form but becomes a no-op (`array.lazy[...]` and `array[...]` behave identically). An escape hatch (`array.eager[...]` or `array[..., eager=True]` or similar — name to be settled) is available for the remaining holdouts and itself emits a deprecation warning.
-3. **5.0**: remove the eager escape hatch and the (now-redundant) `array.lazy[...]` accessor. `Array.__getitem__` is the only path; it is lazy.
+3. **A future major release** (after the deprecation window): remove the eager escape hatch and the (now-redundant) `array.lazy[...]` accessor. `Array.__getitem__` is the only path; it is lazy.
 
 Each step is a release boundary, not a flag day. The user-facing surface for the lazy API is published in 4.0 and stable from that point on; only the *default* changes between 4.0 and 4.x. Crucially, **the codebase never carries two array types**: an `Array` is always an `Array`; what changes is what its `__getitem__` returns by default.
 
