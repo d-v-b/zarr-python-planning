@@ -47,15 +47,30 @@ The question has been raised explicitly in [`zarr-python#2197`](https://github.c
 
 ## The direction
 
-### A lazy view as the result of indexing
+### Lazy is an accessor on `Array`, not a new type
 
-`Array.__getitem__(selection)` returns a `LazyArray` (or whatever it ends up being called) — a Zarr array view bound to a source array and a composed selection. The view records *what to do* without doing it.
+The end state is that `Array.__getitem__` *itself* returns a lazy view. We get there without splitting the codebase into two array types. The migration runs entirely on the existing `Array` class:
+
+- **In 4.0**, `Array` grows an opt-in accessor — `array.lazy[...]` (working name; the actual name is settled in the migration PR). The accessor's `__getitem__` returns an array view bound to the source `Array` plus a composed selection. The bare `array[...]` keeps its existing eager-NumPy behavior; users opt in by going through the accessor.
+- **In a later 4.x release**, `Array.__getitem__` itself flips to return the same view object the accessor returns. The accessor stays as an unambiguous explicit form but becomes a no-op (`array.lazy[...]` and `array[...]` behave identically).
+- **In 5.0**, the eager path is gone and so is the need for the accessor; `Array.__getitem__` is the only path.
+
+There is never a `LazyArray` class. There is never a period where downstream code has to handle two array types via `isinstance` checks. The change rides on a single type whose `__getitem__` semantics evolve across releases — the same pattern `pathlib.Path` used to absorb `os.path` behaviors without introducing a parallel type.
+
+The view that `array.lazy[...]` returns is *also* an `Array` (or a compatible subclass / view-flavored object that satisfies the same surface). It records *what to do* without doing it. Composed selections, materialization triggers, and Array API conformance all attach to that one type.
 
 ```python
 z = zarr.open(...)             # Array
-v = z[10:20, :, ::2]           # LazyArray, no IO
-w = v[..., 0]                  # LazyArray, selection composed
-arr = np.asarray(w)            # IO happens here, returns NumPy
+
+# 4.0: opt-in lazy via accessor; bare __getitem__ is eager NumPy.
+arr = z[10:20, :, ::2]         # eager: ndarray, IO happens here.
+v   = z.lazy[10:20, :, ::2]    # lazy: an Array view, no IO yet.
+w   = v[..., 0]                # composed; still no IO.
+arr = np.asarray(w)            # materialization: NumPy out.
+
+# Later 4.x: __getitem__ itself flips. The two forms become equivalent.
+v   = z[10:20, :, ::2]         # lazy by default.
+v   = z.lazy[10:20, :, ::2]    # same.
 ```
 
 Materialization is triggered by:
@@ -63,11 +78,15 @@ Materialization is triggered by:
 - Array API entry points where the standard requires concrete data.
 - Iteration or scalar coercion (with the usual warnings about expensive operations).
 
-The view carries the metadata of the result (shape, dtype, chunk layout) computed from the source plus the composed selection — these are pure functions of the inputs, which is exactly the kind of thing the [functional core](./functional-core.md) makes easy to compute.
+The view carries the metadata of the result (shape, dtype, chunk layout) computed from the source plus the composed selection — these are pure functions of the inputs, computed from the `IndexTransform` algebra (see below) and the source array's metadata. This is exactly the kind of thing the [functional core](./functional-core.md) makes easy to compute.
 
-### Composition of selections
+### Composition of selections: the `IndexTransform` algebra
 
-Chained indexing composes selections rather than materializing intermediate arrays. `z[a][b]` is equivalent to `z[compose(a, b)]` with respect to the eventual IO. The selection representation needs to be richer than a single Python `slice` object to support boolean indexing, fancy indexing, and the array-api advanced indexing rules; the same representation is what the planner consumes.
+Chained indexing composes selections rather than materializing intermediate arrays. `z[a][b]` is equivalent to `z[compose(a, b)]` with respect to the eventual IO. The selection representation needs to be richer than a single Python `slice` object to support boolean indexing, fancy indexing, and the Array API's advanced indexing rules.
+
+The data structure for this is `IndexTransform`: an internal type representing a composable, lazy coordinate mapping from output indices to source-array indices. It is *internal* — users don't see it directly; they see the lazy view object whose composition is implemented in terms of it. The foundational `IndexTransform` library is in flight at [zarr#3906](https://github.com/zarr-developers/zarr-python/pull/3906) and lands ahead of the rest of the lazy-indexing work.
+
+`IndexTransform` is what the planner (below) consumes when turning chained selections into IO plans. Because composition is a pure function on `IndexTransform` values, the planner can reason about an arbitrarily deep chain of `array.lazy[a][b][c][...]` calls without materializing any intermediates.
 
 ### Array API conformance
 
@@ -111,21 +130,22 @@ The implicit batching context is the ergonomic win; the explicit form is the one
 ## What this is not
 
 - **Not a Dask replacement.** Dask handles distribution, scheduling, and computation graphs. This proposal handles IO planning for a single Zarr array surface. Users who want distributed computation continue to use Dask; the difference is that Dask is no longer the *only* way to get basic IO batching.
-- **Not full lazy compute.** Element-wise operations, reductions, and broadcasting are not part of this proposal. A `LazyArray` view is a *view onto stored data*, not a deferred computation graph. Returning a different type from arithmetic operations is out of scope.
+- **Not full lazy compute.** Element-wise operations, reductions, and broadcasting are not part of this proposal. The lazy view is a *view onto stored data*, not a deferred computation graph. Arithmetic operations materialize the view as today.
+- **Not a new array type.** The end state is `Array` with lazy semantics, not `LazyArray` next to `Array`. The accessor in 4.0 is the opt-in mechanism; the codebase carries one array type throughout.
 - **Not an immediate flag-day break.** The current eager-numpy behavior remains available behind a flag (or as a deprecated `Array.get_eager(...)` method) through one or more 4.x releases. New code uses the lazy API; existing code keeps working with a deprecation warning.
 - **Not "make zarr arrays act like numpy arrays."** This proposal pushes the other direction: zarr arrays act like zarr arrays, and conversion to numpy is explicit.
 
 ## Migration
 
-The transition is staged:
+The transition is staged. No new array *type* is ever introduced; the migration is entirely about the semantics of `Array.__getitem__`.
 
-1. **4.0**: introduce `LazyArray` and `Array.lazy_getitem(...)`. `__getitem__` retains its current eager behavior; a deprecation warning fires when `__getitem__` is used on an array constructed with `lazy=True`.
-2. **4.x**: flip the default. `Array.__getitem__` returns `LazyArray` by default. `Array(eager_getitem=True)` is available as an escape hatch and emits a deprecation warning.
-3. **5.0**: remove eager `__getitem__`. The escape hatch is removed; all indexing is lazy.
+1. **4.0**: ship the foundational `IndexTransform` algebra ([zarr#3906](https://github.com/zarr-developers/zarr-python/pull/3906)) and the `array.lazy[...]` accessor. The accessor's `__getitem__` returns a lazy view bound to the source `Array`. The bare `array[...]` keeps its existing eager-NumPy behavior. Users opt in by going through the accessor; no downstream code breaks. A deprecation warning starts firing on bare `array[...]` calls in cases where the lazy form would be preferable, pointing users at the accessor.
+2. **4.x**: flip the default of `Array.__getitem__` to lazy. The `array.lazy[...]` accessor stays as an unambiguous explicit form but becomes a no-op (`array.lazy[...]` and `array[...]` behave identically). An escape hatch (`array.eager[...]` or `array[..., eager=True]` or similar — name to be settled) is available for the remaining holdouts and itself emits a deprecation warning.
+3. **5.0**: remove the eager escape hatch and the (now-redundant) `array.lazy[...]` accessor. `Array.__getitem__` is the only path; it is lazy.
 
-Each step is a release boundary, not a flag day. The user-facing surface for the lazy API is published in 4.0 and stable from that point on; only the *default* changes between 4.0 and 4.x.
+Each step is a release boundary, not a flag day. The user-facing surface for the lazy API is published in 4.0 and stable from that point on; only the *default* changes between 4.0 and 4.x. Crucially, **the codebase never carries two array types**: an `Array` is always an `Array`; what changes is what its `__getitem__` returns by default.
 
-The interaction with downstream libraries is the load-bearing question for sequencing. Xarray, Dask, and napari all consume `zarr-python`'s eager `__getitem__`; they will need a release that supports both eager and lazy paths before we can flip the default. The transition mirrors the 2.x→3.x migration: announce, give downstreams time, then flip.
+The interaction with downstream libraries is the load-bearing question for sequencing. Xarray, Dask, and napari all consume `zarr-python`'s eager `__getitem__`; they will need a release that supports both eager and lazy paths before we can flip the default. The transition mirrors the 2.x→3.x migration: announce, give downstreams time, then flip. Because there is no new array type to handle, the downstream change is "accept that `array[...]` now returns a view that materializes on `np.asarray`," not "handle a new `LazyArray` class."
 
 ## Relationship to existing proposals
 
@@ -138,7 +158,7 @@ The interaction with downstream libraries is the load-bearing question for seque
 ## Open questions
 
 - **Selection representation.** Python's `slice` is not expressive enough. Options: a dataclass-based `IndexExpr` algebra (TensorStore-style), a NumPy-fancy-index-style array, or something custom. The choice has downstream implications for the planner.
-- **Naming.** `LazyArray`, `ArrayView`, `Slice`, `IndexExpr` — there's a naming exercise to do that affects every example in the documentation.
+- **Naming.** The accessor name (`array.lazy` is the working name; `array.view` and `array.slice` were considered) and the escape-hatch name for stage 2 (`array.eager`, `array[..., eager=True]`, or similar). The internal `IndexTransform` name is settled by the [in-flight PR](https://github.com/zarr-developers/zarr-python/pull/3906); it's an internal data structure and not user-facing, so its name is not load-bearing for documentation.
 - **Materialization API.** `np.asarray(view)` is automatic; `view.compute()` is explicit. Do we want both? Just one? Does it return NumPy specifically, or whatever the array-api `__array_namespace__` resolution gives us?
 - **Batching boundary.** Is `with zarr.batch():` the right shape, or do we want something more like a session object that batches its own calls? The TensorStore `Batch` API is one reference point.
 - ~~Interaction with caching.~~ **Resolved** by [performance.md § Caching](./performance.md#caching): the query planner sits *above* the cache substrate. Building an IO plan consults the cache and the in-flight-dedup table; chunks already in cache produce no IO in the resulting plan, chunks with an in-flight read produce a join-the-future entry rather than a duplicate fetch. The cache layer is responsible for storage and eviction; the planner is responsible for what to fetch.

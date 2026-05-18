@@ -89,7 +89,7 @@ Concretely, the levels of the stack — from most abstract to most concrete — 
 
 1. **Conventions** — domain-specific schemas built on top of Zarr (OME-NGFF, GeoZarr, anndata-zarr). Consumers: validators, format-specific readers, the `yaozarrs` / `ome-zarr-models-py` line of work.
 2. **Groups** — Zarr hierarchies, traversal, group-level attributes.
-3. **Arrays** — the user-facing array object, plus indexing and slicing. In 4.0 this level grows [lazy indexing and Array API conformance](./proposals/lazy-indexing.md): a `LazyArray` view becomes available alongside the eager `__getitem__`, and the query planner sits here. The default flips to lazy in a later 4.x release; the eager path is removed in 5.0.
+3. **Arrays** — the user-facing array object, plus indexing and slicing. In 4.0 this level grows [lazy indexing and Array API conformance](./proposals/lazy-indexing.md): an opt-in `array.lazy[...]` accessor on the existing `Array` class returns a lazy view, and the query planner sits here. The default of bare `array[...]` flips to lazy in a later 4.x release; the eager path is removed in 5.0. There is no new array type — the migration runs on a single `Array` class whose `__getitem__` semantics evolve across releases.
 4. **Chunk decoding** — the codec pipeline. In 4.0 this becomes a [small stateless capability bundle](./proposals/codecs.md) (encode / decode / optional `decode_into` / capability flags) decoupled from the rest of the library, with concrete codec implementations as plug-ins. This is also the seam where alternative engines (Zarrs, TensorStore) plug in — see the [performance proposal](./proposals/performance.md#wrapping-zarrs-and-tensorstore-as-alternative-engines).
 5. **Chunk addressing** — chunk grids and key encodings that map array coordinates to store keys. Lives in the [`zarr-metadata` package](./proposals/functional-core.md#the-packages) as pure-data descriptions; accelerating new grids and key encodings (one of the 4.0 goals above) is mechanically a matter of adding new entries to this package.
 6. **Stores** — the key-value layer. In 4.0 this is *not* a monolithic `Store` class but a set of [capability protocols](./proposals/stores.md) (`Get`, `GetRange`, `Put`, `Delete`, `List`, ...) that backends declare and compose. Composable wrappers add caching, range coalescing, transactions, and retries on top, and a conformance suite defines what each capability means. See [stores.md](./proposals/stores.md) for the theme proposal; the detailed [API](./proposals/stores-api.md), [wrappers](./proposals/stores-wrappers.md), and [conformance suite](./proposals/stores-conformance.md) are linked from there.
@@ -126,9 +126,15 @@ The store abstraction conflates lifecycle, path handling, sync/async, capability
 
 → [proposals/stores.md](./proposals/stores.md) (with tier-3 specs linked from there)
 
+### Performance
+
+A cross-cutting theme that ties the codec, store, and functional-core work into one performance story. Typed library-owned concurrency resources (`ComputeConcurrency`, `IoConcurrency`); synchronous codec encode/decode; range coalescing; pre-allocated decode buffers; in-flight request deduplication; ETag-style revalidation; a unified `AsyncCache`-shaped caching substrate with sensible defaults; an adaptive whole-shard-vs-coalesced read strategy; the concurrency-and-correctness contract; and pluggable high-performance backends via the engine boundary (Zarrs, TensorStore). The integrated story lives in this one proposal so reviewers and stakeholders can read about end-to-end speedups in one place.
+
+→ [proposals/performance.md](./proposals/performance.md)
+
 ### Lazy indexing
 
-`Array.__getitem__` performs IO eagerly and returns NumPy, which makes Zarr arrays the odd one out among modern array libraries, blocks participation in the Python Array API ecosystem, and forces every performance-sensitive user through Dask to recover basic IO optimizations like deduplication, slice fusion, and range coalescing. Make indexing return a lazy view by default, conform to the Array API standard, and introduce a small query planner that turns chained selections into a single IO plan before any chunks are fetched.
+`Array.__getitem__` performs IO eagerly and returns NumPy, which makes Zarr arrays the odd one out among modern array libraries, blocks participation in the Python Array API ecosystem, and forces every performance-sensitive user through Dask to recover basic IO optimizations like deduplication, slice fusion, and range coalescing. Add an opt-in `array.lazy[...]` accessor in 4.0 backed by a stable coordinate-mapping algebra ([PR open](https://github.com/zarr-developers/zarr-python/pull/3906)), flip the default of bare `array[...]` to lazy in a later 4.x release, and conform to the Array API standard alongside. A small query planner turns chained selections into a single IO plan before any chunks are fetched. No new array type is introduced — the codebase carries one `Array` class throughout.
 
 → [proposals/lazy-indexing.md](./proposals/lazy-indexing.md)
 
@@ -162,8 +168,59 @@ The user-facing APIs that don't fit into the other themes but that users have be
 
 → [proposals/missing-apis.md](./proposals/missing-apis.md)
 
-### Performance
+## Roadmap
 
-Performance is cross-cutting. Typed concurrency resources (`ComputeConcurrency`, `IoConcurrency`); synchronous codec encode/decode; range coalescing; pre-allocated decode buffers; in-flight request deduplication; ETag-style revalidation; a unified `AsyncCache`-shaped caching substrate with sensible defaults; an adaptive whole-shard-vs-coalesced read strategy; and pluggable high-performance backends via the engine boundary (Zarrs, TensorStore). The integrated story — including the concurrency and correctness model — lives in this one proposal so reviewers and stakeholders can read about end-to-end speedups in one place.
+The proposals above describe *what* changes; this section describes *when* and *in what order*. Work is grouped into four phases. Each phase has a clear purpose, depends on the phase before it, and produces value on its own — there is no big-bang release where everything ships at once.
 
-→ [proposals/performance.md](./proposals/performance.md)
+A reader who wants the granular per-proposal sequencing should follow the links into the proposals themselves; each substantial proposal has its own migration / sequencing section. What follows is the release-shaped view of how those plans compose.
+
+### Phase 0 — Foundation (lands first; required by everything else)
+
+The structural work that the rest of the plan depends on. Until this lands, the other phases can be designed in parallel but cannot ship.
+
+1. **Functional-core refactor** — extract the pure-data layer (metadata, chunk-addressing math, codec configurations) from the side-effecting layer (stores, codec execution, IO). Establishes the engine boundary that lets alternative engines plug in. → [proposals/functional-core.md](./proposals/functional-core.md)
+2. **Per-level package split** — `zarr-metadata`, `zarr-store`, `zarr-codec`, `zarr-dtype` as focused packages, with `zarr-python` as the facade that re-exports them and ships the default Python engine. → [proposals/functional-core.md § Concrete packaging plan](./proposals/functional-core.md#concrete-packaging-plan)
+3. **Stores API rewrite** — capability protocols, `ReadResult` / `PutResult` / `Generation`, the wrapper-based composition model, the `Serializable` capability that lets stores cross language boundaries. → [proposals/stores.md](./proposals/stores.md) (plus tier-3 specs)
+4. **Lazy indexing — the composable coordinate-mapping algebra** — the foundational `IndexTransform` data structure that lazy `__getitem__` is built on. **Ahead of the rest of Phase 0**: the library is already in flight at [zarr#3906](https://github.com/zarr-developers/zarr-python/pull/3906). The 4.0 migration adds an opt-in `array.lazy[...]` accessor to the existing `Array` class; later 4.x flips the default of bare `array[...]`; 5.0 removes the eager path. No new array type is ever introduced — the codebase carries one `Array` whose `__getitem__` semantics evolve across releases. → [proposals/lazy-indexing.md](./proposals/lazy-indexing.md)
+
+### Phase 1 — Performance and concurrency (lands on Phase 0)
+
+The architectural patterns from `zarrs` and TensorStore that make the pure-Python mode credible. Each work package here can ship as a minor release once Phase 0 is in place.
+
+4. **Codec API rewrite** — sync-first encode/decode, single-element signatures, `decode_into` capability, `recommended_concurrency` advertisement, `PartialDecodeCapability` flags. → [proposals/codecs.md](./proposals/codecs.md)
+5. **Typed concurrency resources + shrinking-value budget** — library-owned `ComputeConcurrency` / `IoConcurrency` pools; per-call budgets that strictly shrink as they descend the call stack; ends the "nested calls multiply concurrency" bug. → [proposals/performance.md § 1](./proposals/performance.md#1-concurrency-is-typed-library-owned-and-shared-across-nested-calls)
+6. **Cache substrate** — one `AsyncCache`-shaped base, in-flight dedup unconditional, metadata cache on by default with ETag revalidation, opt-in chunk caching via `with_caching(...)`. → [proposals/performance.md § Caching](./proposals/performance.md#caching)
+7. **Store-layer range coalescing and conditional reads** — batched `get_partial_many`-shaped API, ETag-aware revalidation via `Generation`, the rest of the perf lessons §3–§9 from performance.md. → [proposals/performance.md](./proposals/performance.md), [proposals/stores-range-coalescing.md](./proposals/stores-range-coalescing.md)
+
+### Phase 2 — User-facing surface (lands on Phase 1)
+
+The work users see directly. Most of this becomes implementable once the Phase 0 + 1 substrate is in place.
+
+8. **Array API conformance and the query planner** — `Array` grows into a full Array-API-conformant surface; the planner that consumes the `IndexTransform` algebra from Phase 0 turns chained selections into batched IO plans. (The underlying algebra and the opt-in accessor ship in Phase 0; the planner and conformance layer ship here, on top of the cache substrate and concurrency resources from Phase 1. The default flip happens here as well.) → [proposals/lazy-indexing.md](./proposals/lazy-indexing.md)
+9. **Device-agnostic IO** — `read_into` / `decode_into` capabilities; Array API namespace selection at materialization. GPU support falls out for free; the more common application is pre-allocated CPU buffers. → [proposals/gpu.md](./proposals/gpu.md)
+10. **Observability** — `Metrics` object, OpenTelemetry auto-instrumentation across the stack, chunk-level introspection APIs (the surface VirtualiZarr and Kerchunk need). → [proposals/observability.md](./proposals/observability.md)
+11. **Missing APIs** — explicit constructors replacing `mode=`; typed exceptions; rich reprs; `__truediv__` group traversal; `__dask_tokenize__`; ZEP 8 URLs; the rest of the user-facing convenience surface. → [proposals/missing-apis.md](./proposals/missing-apis.md)
+
+### Phase 3 — Ecosystem (lands on Phase 2)
+
+The work that extends the library's reach beyond what `zarr-python` ships directly.
+
+12. **ML dtype support** — `ml_dtypes` integration for `bfloat16`, `float8` variants, `int4`/`uint4`. Unblocks the ML community using Zarr for model checkpoints. → [proposals/data-types.md](./proposals/data-types.md)
+13. **Engine wrappers for `zarrs` and TensorStore** — `zarr.engines.zarrs` and `zarr.engines.tensorstore` modules that delegate IO to the compiled-language implementations while preserving the `zarr-python` surface. Same `Array`, same `Group`, same Xarray/Dask/napari interop. → [proposals/performance.md § Wrapping zarrs and TensorStore as alternative engines](./proposals/performance.md#wrapping-zarrs-and-tensorstore-as-alternative-engines)
+14. **Arrow integration investigation** — scoped exploration of how Arrow data structures (nullable types, vlen strings, nested types) integrate with Zarr-Python. The investigation itself is the 4.0 deliverable; what ships is determined by what we find. → [proposals/data-types.md § Investigation: Arrow as a substrate for non-numerical dtypes](./proposals/data-types.md#investigation-arrow-as-a-substrate-for-non-numerical-dtypes)
+
+### What's out of scope for 4.0
+
+- **Persisted hierarchy links** (HDF5-style soft/hard/external links that survive across processes). Would require Zarr-Python to define a new on-disk object format unilaterally; needs a Zarr Enhancement Proposal first. The `KvStack` composite store covers the session-time use cases. → [proposals/missing-apis.md § 1](./proposals/missing-apis.md)
+- **Declarative hierarchy schema validation as a shipped feature** — likely a separate `zarr-schema` package layered on `zarr-metadata`, deferred to 4.x.
+- **Cross-process shared-memory caching** — the substrate is designed not to foreclose it, but it doesn't ship in 4.0. → [proposals/performance.md § Caching-specific open questions](./proposals/performance.md#caching-specific-open-questions)
+- **Consolidated metadata redesign as a substantial proposal** — currently a stub; expected to be expanded in a follow-up pass. → [proposals/consolidated-metadata.md](./proposals/consolidated-metadata.md)
+- **Migration tooling for V2→V3** — the 2.x → 3.x transition is effectively resolved (per the Background section); we're not investing further in migration acceleration.
+
+### How phases compose
+
+The phases are not strict serial dependencies. Within a phase, items can ship in parallel; across phases, the dependency is *infrastructural* (Phase 1 requires the functional-core refactor's clean seams to exist, Phase 2 requires Phase 1's cache substrate and concurrency resources, etc.) but the *design* work for later phases can run alongside earlier-phase implementation.
+
+What this means for a reader trying to estimate the work: Phase 0 is the gate. Once functional-core, packaging, and the stores API rewrite are landed, the rest of the plan ships incrementally as the team works through it. There is no "big push" needed; each subsequent work package can be a focused minor release.
+
+The pure-Python performance work (Phase 1) is the load-bearing pitch for "Zarr-Python continues to be worth using as more than a compatibility shim." If we ship Phase 0 and stall on Phase 1, the [both-and framing](#why-zarr-python-exists) collapses. If we ship Phase 1, everything downstream is incremental on top.
