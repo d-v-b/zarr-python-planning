@@ -190,6 +190,8 @@ Stores                                     ← Chunk cache (encoded)
 
 The substrate is a **horizontal capability** that cuts through every level. Each instance caches the right granularity for the boundary it sits at. The shared `CachePool` ensures that when memory is tight, the LRU evicts across all caches uniformly rather than letting any one cache monopolize the budget.
 
+The caches at the array/group layer (decoded chunk, metadata) are not store-layer wrappers. They wrap the [hierarchy-layer verbs](./hierarchy-layer.md) (`read_array_metadata`, `read_chunk`, ...) because the store layer is key-agnostic and cannot tell a metadata read from a chunk read. The encoded-chunk and negative-result caches at the bottom of the diagram *are* store-layer wrappers ([`Caching[S]`](./stores-caching.md)) because they cache bytes-at-keys and need no hierarchy knowledge. The shard-index and partial-decoder caches live inside the codec pipeline and are managed by it. The substrate is shared; the wrappers stratify by what each layer can reason about.
+
 ### How caching interacts with other proposals
 
 Caching-specific cross-references (the document-level [Relationship to other proposals](#relationship-to-other-proposals) covers everything else):
@@ -204,6 +206,8 @@ Caching-specific cross-references (the document-level [Relationship to other pro
 ### Default caching policy
 
 The catalog above describes *what caches can exist*. A separate decision is **which of them are on by default**. The position taken here is that the right default is not uniform — some caches are unconditional wins, others are workload-dependent, and the library should ship a three-tier policy rather than one global switch.
+
+This policy is implemented at the **hierarchy layer**, not the store layer. The store layer's `Caching[S]` ([stores-caching.md](./stores-caching.md)) is key-agnostic — it cannot tell a metadata read from a chunk read because the store layer doesn't know about hierarchy semantics. The tier-aware policy below requires hierarchy knowledge ("this is a `read_array_metadata` call; cache it" vs "this is a `read_chunk` call; only cache if opted in") and therefore lives in the hierarchy-layer cache wrapper that wraps the hierarchy verbs ([hierarchy-layer.md § How caching stratifies cleanly](./hierarchy-layer.md#how-caching-stratifies-cleanly)). The user-facing entry point is `array.with_caching(...)` and `group.with_caching(...)`; the store-layer `backend.with_caching(...)` is a separate, key-agnostic surface for "cache the raw bytes from this backend."
 
 #### Tier 1: Unconditional — in-flight request deduplication
 
@@ -221,7 +225,7 @@ The benefit is concrete. Xarray's `open_zarr(...)` re-reads the consolidated met
 
 **Position**: the metadata cache is on by default with a small bounded budget (proposed starting point: ~10 MB, configurable; the number is a placeholder for benchmarking). Revalidation uses storage generations when the underlying store supports them (per [stores.md](./stores.md)); for stores that don't, the cache uses a short TTL (proposed starting point: ~5 seconds, configurable). When a TTL-tracked entry is read past its TTL the cache transparently re-fetches the metadata document, decodes it, and replaces the entry. There is no staleness window beyond the configured TTL.
 
-A user with a legitimate need to disable it (test fixtures that depend on observing every read; correctness-debug sessions) does so with `store.with_caching(metadata=False)`.
+A user with a legitimate need to disable it (test fixtures that depend on observing every read; correctness-debug sessions) does so with `array.with_caching(metadata=False)`.
 
 #### Tier 3: Opt-in — chunk cache
 
@@ -234,20 +238,20 @@ Chunk caching is workload-dependent in a way the other two are not:
 
 The two reference implementations agree. `zarrs`'s [chunk-cache documentation](https://github.com/zarrs/zarrs/blob/main/zarrs/src/array/chunk_cache.rs) explicitly warns: *"Chunk caching may reduce performance. Benchmark your algorithm."* TensorStore exposes caching as an explicit `cache_pool` resource that the user attaches. Neither makes it the default.
 
-**Position**: the chunk cache is opt-in. The user enables it explicitly:
+**Position**: the chunk cache is opt-in. The user enables it explicitly on an opened array or group, *not* on a store (because the store layer is key-agnostic and can't distinguish chunks from metadata):
 
 ```python
-# Bare backend, no chunk caching:
-store = LocalStore("/data.zarr")
+# Open an array — no chunk caching by default.
+arr = zarr.open_array("/data.zarr")
 
-# Same backend, chunk caching enabled with the default size:
-store = LocalStore("/data.zarr").with_caching(chunks=True)
+# Same array, chunk caching enabled with the default size:
+arr = zarr.open_array("/data.zarr").with_caching(chunks=True)
 
 # Or with an explicit budget:
-store = LocalStore("/data.zarr").with_caching(chunks="256 MB")
+arr = zarr.open_array("/data.zarr").with_caching(chunks="256 MB")
 ```
 
-The `.with_caching(...)` method is sugar over the `Caching[S]` wrapper from [stores-caching.md](./stores-caching.md). Making it a one-call method on every backend means users discover it via autocomplete and documentation, not by knowing to wrap manually. *Adopting this policy adds one requirement to [stores-caching.md](./stores-caching.md): every backend exposes a `with_caching(...)` method whose signature accepts the per-cache-type toggles described in this section (`metadata=`, `chunks=`, `negative=`, ...). The wrapper class itself stays unchanged; the method is a thin constructor call.*
+The `Array.with_caching(...)` / `Group.with_caching(...)` methods construct the hierarchy-layer cache wrapper (per [hierarchy-layer.md](./hierarchy-layer.md)). They are sugar over the wrapper constructor; making them one-call methods means users discover them via autocomplete and documentation, not by knowing to wrap manually. A separate, key-agnostic `backend.with_caching(...)` exists on every backend ([stores-caching.md](./stores-caching.md)) for the lower-level case "cache raw bytes from this backend"; the two compose.
 
 For the cases where chunk caching is obviously right — interactive Jupyter sessions in particular — the project ships a named preset. Concretely, something along the lines of `zarr.use_preset("interactive")` (or `ZARR_PRESET=interactive` in the environment) flips a small set of defaults for that process: chunk caching on, larger metadata budget, and any other interactive-friendly settings the preset gains. The preset is a named bundle of config overrides; the configuration substrate that holds them is being redesigned (see [missing-apis.md](./missing-apis.md) — `donfig` is being retired in 4.0), but the *shape* — a preset name resolving to a bundle of overrides — survives whatever substrate replaces it. The user gains the caching with one config line; the library does not silently double the memory cost of every script that opens a Zarr array.
 
@@ -255,10 +259,10 @@ For the cases where chunk caching is obviously right — interactive Jupyter ses
 
 The remaining caches in the catalog (encoded chunk cache, shard index cache, partial-decoder cache, negative-result cache) follow the same logic:
 
-- **Encoded chunk cache**: opt-in. Same workload-dependence as the decoded chunk cache.
-- **Shard index cache**: on by default for sharded arrays. The shard index is small, accessed on every subchunk read, and never changes once a shard is written. The cost is negligible.
+- **Encoded chunk cache**: opt-in at the *store* layer via `backend.with_caching(...)` (key-agnostic; sees raw bytes). Same workload-dependence as the decoded chunk cache.
+- **Shard index cache**: on by default for sharded arrays. The shard index is small, accessed on every subchunk read, and never changes once a shard is written. The cost is negligible. Managed inside the sharding codec.
 - **Partial-decoder cache (internal pipeline cache)**: managed by the codec pipeline itself, not user-facing. The pipeline inserts caches at the right points per [lesson §7](#7-internal-pipeline-caches-between-non-partial-decode-codecs); the user does not see them. Lifetime is per-call (one full decode reused across the partial reads of that call), so memory pressure is bounded by request shape.
-- **Negative result cache**: off by default. Useful for code that probes for optional keys; harmful for code that races a check against a create. Opt-in via `with_caching(negative=True)`.
+- **Negative result cache**: off by default. Lives at the *store* layer ([stores-caching.md](./stores-caching.md) — `cache_negative=True`). Useful for code that probes for optional keys; harmful for code that races a check against a create.
 
 #### Summary
 
@@ -267,10 +271,10 @@ The remaining caches in the catalog (encoded chunk cache, shard index cache, par
 | In-flight dedup | Unconditional | No staleness, no budget, always-correct, always-helpful |
 | Metadata cache | On (small budget, ETag-revalidated) | Small, infrequent changes, big interactive-latency win |
 | Shard index cache | On (sharded arrays only) | Tiny, immutable, hot path |
-| Chunk cache (decoded) | Opt-in via `.with_caching(chunks=True)` | Workload-dependent; bad default for writes and bulk ETL |
-| Chunk cache (encoded) | Opt-in | Same as decoded, different layer |
+| Chunk cache (decoded) | Opt-in via `array.with_caching(chunks=True)` (hierarchy layer) | Workload-dependent; bad default for writes and bulk ETL |
+| Chunk cache (encoded) | Opt-in via `backend.with_caching(...)` (store layer; key-agnostic) | Same workload-dependence as decoded; different layer |
 | Partial-decoder cache | On (automatic, per-call lifetime, no user surface) | Bounded by request shape; the win is fancy indexing into compressed chunks (§7) |
-| Negative-result cache | Opt-in | Race conditions with concurrent creates |
+| Negative-result cache | Opt-in via `backend.with_caching(cache_negative=True)` (store layer) | Race conditions with concurrent creates |
 
 The principle: the default is the right answer for *almost everyone* in the case where the answer is universally correct, and opt-in everywhere else. The user who wants more caching gets it with a single method call; the user who wants none gets it the same way. The library does not silently make memory or consistency decisions for the user when those decisions depend on workload.
 

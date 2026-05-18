@@ -2,7 +2,7 @@
 
 This document specifies the transactional layer of the [Stores API proposal](./stores-api.md). It addresses the [V2 → V3 regression on atomic rename-into-place](https://github.com/zarr-developers/zarr-python/discussions/3410) and gives [Icechunk](https://github.com/earth-mover/icechunk) and similar transactional-storage backends a typed surface to declare their capabilities against.
 
-The design adopts TensorStore's transaction model directly. TensorStore has eight years of production experience with transactions over object-storage-shaped backends and has settled on a small, opinionated surface: a free-standing `Transaction` object bound to stores by view, two boolean knobs (`atomic` and `repeatable_read`) covering the entire isolation/atomicity space, per-key generations rather than store-wide versions, and conditional writes via `if_equal` on per-call methods rather than baked into a separate protocol family. The earlier draft of this document had a two-protocol hierarchy (`Transactional` and `TransactionalOCC`) with `OCCTransactionContext` and a `Version` token; this revision collapses both into one protocol along TensorStore's lines, because the role-model evidence is strong and the simpler shape covers every use case the two-protocol shape covered. ([TensorStore Transaction](https://google.github.io/tensorstore/python/api/tensorstore.Transaction.html), [KvStore.with_transaction](https://google.github.io/tensorstore/python/api/tensorstore.KvStore.with_transaction.html))
+The design adopts TensorStore's transaction model directly. TensorStore has eight years of production experience with transactions over object-storage-shaped backends and has settled on a small, opinionated surface: a free-standing `Transaction` object bound to stores by view, two boolean knobs (`atomic` and `repeatable_read`) covering the entire isolation/atomicity space, per-key generations rather than store-wide versions, and conditional writes via `if_equal` on per-call methods rather than baked into a separate protocol family. ([TensorStore Transaction](https://google.github.io/tensorstore/python/api/tensorstore.Transaction.html), [KvStore.with_transaction](https://google.github.io/tensorstore/python/api/tensorstore.KvStore.with_transaction.html))
 
 The load-bearing claims are:
 
@@ -86,7 +86,7 @@ class Get(Protocol):
 | `ObstoreStore` | The backend's native ETag/version (S3 ETag, GCS generation, Azure ETag) |
 | Icechunk-as-adapter | Content hash of the value |
 
-Backends without a generation set the field to `None`. Calls passing `if_match` or `if_none_match` to a backend without generation support raise `NotImplementedError` at the wrapper layer rather than silently ignoring the precondition; the alternative would silently lose conflict detection.
+Backends without a generation set the field to `None`. Calls passing `if_match` or `if_none_match` to a backend without generation support raise `TypeError` rather than silently ignoring the precondition; the alternative would silently lose conflict detection. (Pinning this as `TypeError` per the canonical definition in [stores-api.md § Capability protocols](./stores-api.md#capability-protocols); the conformance suite asserts this in `test_put_if_match_on_backend_without_generations_raises_typeerror`.)
 
 ### `LocalStore` rename-into-place
 
@@ -229,7 +229,7 @@ The retry loop is caller-side. zarr-python does not ship an `atomic_update` help
 | False | True | OCC reads without write atomicity (rare; mostly a check-then-write pattern where individual writes are safe per-key) |
 | True | True | Full transactional update with concurrent writers (Icechunk's primary mode, the safe-update pattern above) |
 
-Two booleans cover the entire space TensorStore has used in production for eight years. The earlier draft's separate `Transactional` and `TransactionalOCC` protocols were modeling the bottom-right cell of this table as a separate type, which is unnecessary complexity.
+Two booleans cover the entire space TensorStore has used in production for eight years. Treating the bottom-right cell as a separate protocol type would be unnecessary complexity.
 
 ## Per-backend support
 
@@ -248,11 +248,15 @@ The key reframe: **Icechunk is an *adapter*, not a backend.** It wraps a non-tra
 
 ```python
 inner = ObstoreStore(S3Store(bucket="b", region="us-east-1"))
+# `IcechunkAdapter` here is illustrative — the actual integration is
+# in the [icechunk](https://github.com/earth-mover/icechunk) project,
+# which ships its own adapter that satisfies the Transactional protocol
+# defined here. The name and exact constructor signature are owned by
+# that project; this proposal commits to the protocol surface, not to
+# Icechunk's API.
 store = IcechunkAdapter(inner, repository="my-array")
 # store: Transactional, with atomic and repeatable_read both available
 ```
-
-This reverses the earlier draft's framing where `ObstoreStore` could in principle grow `Transactional` "if it implemented a manifest layer." That framing conflated two layers; the layered design is cleaner.
 
 ## `LocalStore` multi-key atomicity
 
@@ -327,7 +331,7 @@ The structural changes ship in stages:
 - **`Generation` for `MemoryStore`.** A monotonic per-key counter is the obvious choice. Open question: should `MemoryStore` instances persist their counters across pickling round-trips so a generation observed pre-pickle is comparable post-pickle? Yes is the conservative answer (otherwise OCC across distributed workers breaks); document the contract.
 - **Free-threaded CPython interactions.** `MemoryStore`'s atomicity story rests on the GIL today. Under free-threaded CPython ([zarr#2776](https://github.com/zarr-developers/zarr-python/discussions/2776)), `MemoryStore` needs explicit locking around mutation and generation-counter updates. Track with the broader free-threaded CPython work; not a blocker for the protocol design.
 - **Per-call timeouts on commit.** Long-running commits (large transactions over slow backends) want a timeout knob. TensorStore's `commit_async` returns a `Future` whose `.result(timeout=...)` provides this; zarr-python's `commit()` is sync and would need a `timeout` kwarg. Open question: ship with `timeout` from day one, or punt? Recommend punt — `commit_async()` plus standard `asyncio.wait_for` covers the use case without protocol surface bloat.
-- **`Caching` × `Transactional` resolution.** Refuse-at-construction is the proposed conservative answer. A transaction-aware cache is a future proposal.
+- ~~`Caching` × `Transactional` resolution.~~ **Resolved as refused-at-construction**, per claim 6 above and the symmetric refusal in [stores-caching.md § Composition with other wrappers](./stores-caching.md#composition-with-other-wrappers). A transaction-aware cache is a future proposal.
 - **Cross-store transactions.** A transaction spanning two unrelated stores cannot deliver atomicity without a coordinator. The proposal makes this explicit: `atomic=True` raises at commit if the bound stores do not share a coordinator. Distributed transactions are a large body of work; explicitly out of scope for zarr-python. The recommended pattern is to put both halves behind a single transactional adapter.
 - **`atomic_update` helper.** Out of scope for the initial protocol. TensorStore deliberately does not ship one; we follow. Add later if a real workload justifies it.
 - **`Transactional` on `KvStack`.** A `KvStack` whose layers all satisfy `Transactional` could in principle advertise `Transactional` itself, but commit semantics across layers are weaker than per-layer (atomicity does not compose across heterogeneous backends). Open question: should `KvStack` advertise `Transactional` in the per-layer-only sense, or refuse to advertise it at all? The conservative answer is "advertise per-layer and document that cross-layer atomicity is not delivered"; the strict answer is "do not advertise." Decide before shipping `KvStack` against a transactional layer.

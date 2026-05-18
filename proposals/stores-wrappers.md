@@ -12,7 +12,11 @@ The load-bearing claims:
 
 ```python
 class ReadOnly[S]:
-    """Strips Put, Delete, Copy, Transactional from S's capability set.
+    """Strips the write methods (Put, Delete, Copy) from S's capability
+    set. Preserves Transactional: read-only transactions are well-defined
+    (staged writes fail at construction; an empty transaction commits as
+    a no-op) and useful for repeatable-read snapshots. See
+    [stores-transactional.md](./stores-transactional.md#composition-with-other-wrappers).
     Read capabilities pass through. The type checker rejects writes at
     compile time; the runtime instance simply does not define the
     stripped methods, so attribute access fails with AttributeError if
@@ -43,9 +47,11 @@ class ReadOnly[S]:
         )
 
     # ... and so on for every read capability. Notably, `put`, `delete`,
-    # `copy`, and `with_transaction` are NOT defined on `ReadOnly[S]` regardless
-    # of what S advertises. This is the entire point: the wrapper strips
-    # the write surface.
+    # and `copy` are NOT defined on `ReadOnly[S]` regardless of what S
+    # advertises. This is the entire point: the wrapper strips the write
+    # surface. `with_transaction` IS preserved — read-only transactions
+    # are well-defined and useful (see
+    # stores-transactional.md#composition-with-other-wrappers).
 ```
 
 Replaces today's `Store.with_read_only(read_only=True)` clone-based pattern. Migration path is documented in [stores-api.md migration shims](./stores-api.md#migration-shims-and-deprecation-surface).
@@ -140,7 +146,7 @@ class Tracing[S]:
 ### Tracing semantics
 
 - **Span naming.** `zarr.store.{method}` for every call. Customizable via a `span_namespace` constructor arg if a user wants `myapp.zarr.{method}`.
-- **Standard attributes.** `zarr.store.key` for any method that takes a key. `zarr.store.bytes` for read methods (size of the returned data). `zarr.store.start` / `zarr.store.end` for `get_range`. `zarr.store.range_count` for `get_ranges`.
+- **Standard attributes.** `zarr.store.key` for any method that takes a key. `zarr.store.bytes` for read methods (size of the returned data, via `result.value.nbytes` on `ReadResult`). `zarr.store.start` / `zarr.store.end` for `get_range`. `zarr.store.range_count` for `get_ranges`. `zarr.store.buffer_kind` for `get_streaming` reads (per [stores-api.md § GetStreaming](./stores-api.md#streaming-and-caller-allocated-reads-via-getstreaming)) — names the kind of destination buffer the caller provided (`bytearray`, `numpy`, `cuda`, `dlpack`, ...). `zarr.store.generation` for any read or write that produces a `Generation` (for cache-hit-vs-revalidate diagnostics).
 - **Exceptions.** Every span records exceptions via `span.record_exception(e)` before re-raising.
 - **Zero-cost when off.** The `__new__` short-circuit returns the inner store directly when `tracer is None`, so a `Tracing(store)` with no tracer is equivalent to `store` at runtime with no per-call overhead. Same pattern as `RangeCoalescing` for native `GetRanges` backends.
 
@@ -232,17 +238,20 @@ class AsyncToSync[S]:
 
 ## Composition rules
 
-| Inside ↓ \ Outside → | `ReadOnly` | `Retry` | `Tracing` | `SyncToAsync` | `AsyncToSync` | `Caching` | `RangeCoalescing` | `Prefixed` | `Transactional` |
-|---|---|---|---|---|---|---|---|---|---|
-| `ReadOnly` | idempotent | OK | OK | OK | OK | OK | OK | OK | strips writes |
-| `Retry` | OK | flatten | OK | OK | OK | OK | OK | OK | see [transactional](./stores-transactional.md#composition-with-other-wrappers) |
-| `Tracing` | OK | OK | flatten | OK | OK | OK | OK | OK | OK |
-| `SyncToAsync` | OK | OK | OK | absurd | OK (round trip) | OK | OK | OK | OK if the inner `Transactional` is sync; `Transaction.commit_async()` is then itself thread-bridged |
-| `AsyncToSync` | OK | OK | OK | OK (round trip) | absurd | OK | OK | OK | OK if the inner `Transactional` is async; `Transaction.commit()` runs the loop |
-| `Caching` | OK | OK | OK | OK | OK | flatten | order matters | OK | refused |
-| `RangeCoalescing` | OK | OK | OK | OK | OK | order matters | flatten | OK | OK |
-| `Prefixed` | OK | OK | OK | OK | OK | OK | OK | flatten | OK |
-| `Transactional` | strips | retry-then-commit caveat | OK | depends | depends | refused | OK | OK | nested? |
+| Inside ↓ \ Outside → | `ReadOnly` | `Retry` | `Tracing` | `SyncToAsync` | `AsyncToSync` | `Caching` | `RangeCoalescing` | `Prefixed` | `Transactional` | `KvStack` |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `ReadOnly` | idempotent | OK | OK | OK | OK | OK | OK | OK | preserves (writes-fail) | OK as one layer |
+| `Retry` | OK | flatten | OK | OK | OK | OK | OK | OK | see [transactional](./stores-transactional.md#composition-with-other-wrappers) | OK as one layer |
+| `Tracing` | OK | OK | flatten | OK | OK | OK | OK | OK | OK | OK as one layer |
+| `SyncToAsync` | OK | OK | OK | absurd | OK (round trip) | OK | OK | OK | OK if the inner `Transactional` is sync; `Transaction.commit_async()` is then itself thread-bridged | OK as one layer |
+| `AsyncToSync` | OK | OK | OK | OK (round trip) | absurd | OK | OK | OK | OK if the inner `Transactional` is async; `Transaction.commit()` runs the loop | OK as one layer |
+| `Caching` | OK | OK | OK | OK | OK | flatten | order matters | OK | refused | OK as one layer (cache wraps one layer of the stack) |
+| `RangeCoalescing` | OK | OK | OK | OK | OK | order matters | flatten | OK | OK | OK as one layer |
+| `Prefixed` | OK | OK | OK | OK | OK | OK | OK | flatten | OK | OK as one layer |
+| `Transactional` | strips | retry-then-commit caveat | OK | depends | depends | refused | OK | OK | nested? | see [transactional § KvStack](./stores-transactional.md#composition-with-other-wrappers) |
+| `KvStack` | OK | OK | OK | OK | OK | OK (cache over the composite) | OK | OK | per-layer; **no cross-layer atomicity** ([transactional](./stores-transactional.md#composition-with-other-wrappers)) | nested KvStack: OK, flattens to one stack of layers |
+
+`KvStack` is a *composite store* rather than a wrapper, but it composes with the wrappers because it satisfies the same capability protocols (the intersection of its layers' surfaces). Reading the table: putting `KvStack` *inside* a wrapper applies the wrapper uniformly to the composite (e.g. `Caching[KvStack[...]]` is one cache fronting the whole stack); putting `KvStack` *outside* a wrapper means each layer is independently wrappable (the wrapper is one layer's; the other layers see the raw backend). For cross-layer transactional atomicity see the dedicated note in [stores-transactional.md § Composition with other wrappers](./stores-transactional.md#composition-with-other-wrappers).
 
 Recommended ordering for cloud-Zarr workloads, outside in:
 

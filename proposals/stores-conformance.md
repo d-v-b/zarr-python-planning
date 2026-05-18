@@ -32,15 +32,18 @@ src/zarr/storage/testing/
         get.py             # GetSpec
         get_range.py       # GetRangeSpec
         get_ranges.py      # GetRangesSpec
+        get_streaming.py   # GetStreamingSpec, GetRangeStreamingSpec, ZeroCopyGetStreamingSpec
         put.py             # PutSpec
         delete.py          # DeleteSpec
         list.py            # ListSpec, ListWithDelimiterSpec
         head.py            # HeadSpec
         copy.py            # CopySpec
         transactional.py   # TransactionalSpec (covers both atomic= and repeatable_read= knobs)
+        serializable.py    # SerializableSpec
     asynchronous/          # mirrors `sync/` with async fixtures and `_async` method names
         get.py             # GetAsyncSpec
         ...
+    composite.py           # KvStackSpec, KeyRangeListSpec (composite-store-specific)
     wrappers.py            # CapabilityPreservationSpec, plus per-wrapper specs:
                            # ReadOnlySpec, CachingSpec, RangeCoalescingSpec,
                            # RetrySpec, TracingSpec, SyncToAsyncSpec, AsyncToSyncSpec,
@@ -221,7 +224,43 @@ The full eight-test sketch and the four-test extension for OCC backends are in [
 - `test_atomic_multi_key`. A multi-`put` transaction either commits all keys or none.
 - `test_per_key_atomicity_no_torn_write`. Single-key writes are observed as either old or new value, never a partial. Skipped on backends that document the limitation (`ZipStore`).
 
-Snapshot-isolation tests are part of `TransactionalSpec` itself, gated on backends that support `Transaction(atomic=True, repeatable_read=True)` (Icechunk and similar). Tests cover `TransactionFailed` conflict semantics, generation round-trip on writes, and that conflict-failed transactions do not leak writes. The earlier `TransactionalOCCSpec` design is retired now that the protocol no longer has a separate OCC variant — see [stores-transactional.md](./stores-transactional.md).
+Snapshot-isolation tests are part of `TransactionalSpec` itself, gated on backends that support `Transaction(atomic=True, repeatable_read=True)` (Icechunk and similar). Tests cover `TransactionFailed` conflict semantics, generation round-trip on writes, and that conflict-failed transactions do not leak writes.
+
+### `GetStreamingSpec`, `GetRangeStreamingSpec`, `ZeroCopyGetStreamingSpec`
+
+Three specs for the streaming / caller-allocated read surface from [stores-api.md § Streaming and caller-allocated reads](./stores-api.md#streaming-and-caller-allocated-reads-via-getstreaming). Each is a stub list; expansion lands alongside the streaming-implementation PR.
+
+- `test_get_streaming_returns_readstream`. `store.get_streaming(key)` returns a context-manager `ReadStream`; entering yields a drainable stream.
+- `test_read_full_into_bytearray`. `stream.read_full(bytearray(size))` writes the full payload into the caller buffer and returns `size`.
+- `test_read_into_partial_chunks`. Repeated `stream.read_into(buf)` calls drain the value chunk-by-chunk; sum of returned counts equals the value size.
+- `test_caller_owned_buffer_invariant`. The store does not modify bytes past the written prefix; the buffer's memory is caller-controlled.
+- `test_streaming_generation_matches_allocating_get`. `stream.generation` equals what `store.get(key).generation` returns at the same instant.
+- `test_zero_copy_into_buffer_protocol_target` (`ZeroCopyGetStreamingSpec`). For backends that advertise zero-copy on a given buffer kind (numpy, CUDA Array Interface, DLPack), assert that the bytes are not copied through an intermediate allocation. Verified via a per-backend instrumentation hook or, where possible, by comparing `id()` of the underlying buffer.
+- `test_cancellation_releases_resources`. Dropping a stream mid-drain (closing the context manager early) releases the underlying connection / file handle without leaking.
+
+### `SerializableSpec`
+
+Tests for the `Serializable` capability from [stores-api.md § Capability protocols](./stores-api.md#capability-protocols). Run for every backend that advertises `Serializable`.
+
+- `test_to_declaration_returns_storedeclaration`. `store.to_declaration()` returns a `StoreDeclaration` whose `kind` matches the backend and whose `config` is JSON-round-trippable.
+- `test_round_trip_via_declaration`. `type(store).from_declaration(store.to_declaration())` produces a store that compares equal to the original (per the equality contract in [stores.md § Equality, hashing, and pickling](./stores.md#equality-hashing-and-pickling)).
+- `test_declaration_is_json_serializable`. `json.loads(json.dumps(declaration.__dict__))` produces equivalent content.
+- `test_pickle_via_declaration`. The backend's `__getstate__` / `__setstate__` defined in terms of `to_declaration` / `from_declaration` round-trip cleanly across `pickle.dumps` / `pickle.loads`. Required for multiprocessing support per [performance.md § Multiprocessing](./performance.md#multiprocessing).
+- `test_declaration_does_not_include_store_contents`. The declaration describes the connection (path, URL, credentials reference) but does not embed stored data. Verified by asserting that the declaration size is bounded regardless of how many keys the store contains.
+
+### `KvStackSpec` and `KeyRangeListSpec`
+
+Composite-store specs for `KvStack` from [stores-api.md § KvStack](./stores-api.md#kvstacks-composite-store).
+
+`KvStackSpec` parameterizes over a sequence of inner stores and key-range bounds; the fixture provides "build me a `KvStack` with these layers and this key population." Highlights:
+
+- `test_per_key_routing`. A `get(key)` dispatches to the layer whose `KeyRange` contains the key; out-of-bounds keys raise `KeyError`.
+- `test_disjoint_ranges_enforced`. `KvStack([...])` raises `ValueError` if any two layers' `KeyRange`s overlap.
+- `test_capability_intersection`. `KvStack[layers...]` advertises the intersection of the layers' capability surfaces; a layer that lacks `Put` removes `Put` from the composite even if other layers have it.
+- `test_listing_merges_layer_results_in_lex_order`. `list(prefix=...)` fans out to layers whose ranges overlap the prefix and yields keys in lexicographic order.
+- `test_no_cross_layer_atomicity`. Multi-key transactions spanning layers commit per-layer; no atomicity is offered across layers (see [stores-transactional.md § Composition with other wrappers](./stores-transactional.md#composition-with-other-wrappers)).
+
+`KeyRangeListSpec` parameterizes over `List`-satisfying backends and asserts that `range` filtering yields exactly the expected keys, that combining `prefix` and `range` intersects correctly, and that empty intersections yield no keys without erroring. Imported alongside `KvStackSpec` because both depend on the same `KeyRange` predicate logic.
 
 ### Async specs
 
@@ -250,14 +289,14 @@ class CapabilityPreservationSpec:
         assert isinstance(wrapped, cap) == isinstance(inner, cap)
 ```
 
-`ALL_CAPABILITIES` is the tuple of every protocol class in `zarr.storage.protocols`. The test parametrizes over all of them and asserts the wrapper's surface matches the inner store's, except for capabilities the wrapper documents itself as adding or removing (e.g., `ReadOnly[S]` removes `Put`/`Delete`/`Copy`/`Transactional` and the spec is given a class-level `removed: set[type]` to subtract).
+`ALL_CAPABILITIES` is the tuple of every protocol class in `zarr.storage.protocols`. The test parametrizes over all of them and asserts the wrapper's surface matches the inner store's, except for capabilities the wrapper documents itself as adding or removing (e.g., `ReadOnly[S]` removes `Put`/`Delete`/`Copy` — but *preserves* `Transactional` — and the spec is given a class-level `removed: set[type]` to subtract). For `KvStack`, the spec runs in *intersection mode*: it takes a list of inner stores and asserts the composite advertises a capability iff *every* inner store does. The class-level knob `mode: Literal["passthrough", "removed", "intersection"]` selects the variant.
 
 ### Per-wrapper specs
 
 Each wrapper has its own spec class with wrapper-specific assertions. These extend the conformance specs (so the wrapped store must still satisfy `GetSpec`, `GetRangeSpec`, etc. when the underlying store does) and add wrapper-specific tests.
 
 - **`ReadOnlySpec`**. `wrapped.put(...)` raises a documented exception type at runtime; `isinstance(wrapped, Put)` is `False`; type-checker rejection is asserted via a separate `mypy --strict` test fixture.
-- **`CachingSpec`**. Cold read fetches from inner; warm read does not (asserted via a counting inner-store mock); writes invalidate the cache; eviction by per-tier byte budgets and `max_entries` and `ttl` each have a dedicated test. The full algorithm, defaults, write-invalidation contract, negative-caching semantics, the three-tier toggles (`metadata`, `chunks`, `negative`), and the full list of tests this spec runs are specified in [stores-caching.md](./stores-caching.md), including the recommended composition order with `RangeCoalescing` (caching outermost, coalescing below) and the migration plan from `experimental.cache_store`.
+- **`CachingSpec`**. Cold read fetches from inner; warm read does not (asserted via a counting inner-store mock); writes invalidate the cache; eviction by `max_bytes` / `max_entries` / `ttl` each have a dedicated test. The full algorithm, defaults, write-invalidation contract, negative-caching semantics, and the full list of tests this spec runs are specified in [stores-caching.md](./stores-caching.md), including the recommended composition order with `RangeCoalescing` (caching outermost, coalescing below) and the migration plan from `experimental.cache_store`. `Caching[S]` is **key-agnostic**; tier-aware caching is a hierarchy-layer concern and is tested separately.
 - **`RangeCoalescingSpec`**. The most important one for #3925: `RangeCoalescing[S]` synthesizes `GetRanges` for an `S` that only implements `GetRange`; the test asserts that calling `wrapped.get_ranges(key, starts=[0, 100], ends=[50, 150])` issues exactly one underlying `get_range(key, start=0, end=150)` call and slices the result, when `max_gap >= 50` and `max_request >= 150`. Negative cases assert non-coalescable inputs do issue separate calls. The full algorithm, defaults, failure semantics, and the nine specific tests this spec runs are specified in [stores-range-coalescing.md](./stores-range-coalescing.md), including the empirically-verified `__new__` short-circuit pattern that lets the wrapper be a no-op when `S` already implements `GetRanges` natively.
 - **`SyncToAsyncSpec`** / **`AsyncToSyncSpec`**. Each capability the inner store advertises gets a sync/async mirror on the wrapped store; round-trip semantics match.
 - **`RetrySpec`**. Retries on documented transient exception types up to `max_attempts`; gives up afterward; passes other exceptions through unmodified.

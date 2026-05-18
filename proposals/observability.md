@@ -19,7 +19,7 @@ Both pillars are cross-cutting in the same way [performance.md](./performance.md
 
 Today, the only way to find out *why* a Zarr workload is slow is to attach a sampling profiler, read the source to figure out which call paths are which, and guess. Concretely:
 
-- **Cache effectiveness is invisible.** Hit rate, eviction count, byte budget utilization, in-flight dedup hits — none of these are exposed. A user who turns on chunk caching with `store.with_caching(chunks=True)` has no way to tell whether it's helping.
+- **Cache effectiveness is invisible.** Hit rate, eviction count, byte budget utilization, in-flight dedup hits — none of these are exposed. A user who turns on chunk caching with `array.with_caching(chunks=True)` has no way to tell whether it's helping.
 - **IO behavior is opaque.** Number of store calls per user request, range-coalescing effectiveness, ETag revalidation hit rate, retry count — all hidden. A user who suspects their object-storage workload is over-fetching has no signal.
 - **Concurrency utilization is hidden.** Whether the `ComputeConcurrency` pool is saturated, whether `IoConcurrency` is bottlenecked, whether per-codec parallelism budgets are being fully used — invisible. This is particularly bad given that the [§1 concurrency model](./performance.md#1-concurrency-is-typed-library-owned-and-shared-across-nested-calls) makes pool ownership a load-bearing design choice; users need to *see* whether their tuning is right.
 - **Codec hot paths are not measured.** Whether decode dominates or IO dominates a workload, whether the partial-decoder cache is paying off, whether sharded reads are using the adaptive whole-shard heuristic — none queryable.
