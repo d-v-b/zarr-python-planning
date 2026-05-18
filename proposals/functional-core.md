@@ -118,7 +118,7 @@ Per [performance.md § Where the caching substrate sits relative to engines](./p
 
 ## What this is not
 
-- **Not a public API change.** The `zarr.open`, `zarr.create_array`, `Array[...]`, `Group[...]` surfaces stay where they are. Existing user code keeps working.
+- **Not driving the 4.0 API changes.** This refactor is internal — the `zarr.open`, `zarr.create_array`, `Array[...]`, `Group[...]` surfaces stay where they are when *only* the functional-core work lands. Other 4.0 proposals (codecs, stores, lazy indexing) do change the user-facing API; see [the README's backwards-compatibility section](../README.md#what-we-do-and-dont-commit-to-for-backwards-compatibility) for the project-wide commitment. The functional-core refactor itself is API-neutral; the bigger 4.0 work is not.
 - **Not a function-by-function API design.** This document argues the direction and the shape of the solution. Concrete signatures and module layouts are deferred to follow-on proposals.
 - **Not a redesign of the store layer.** The existing stores proposal stands; we add only the serialization capability that lets stores cross language boundaries.
 - **Not a single-release push.** The refactor is incremental and staged. The functional core can be extracted and tested alongside the existing internals; engines can be added one at a time; the public facade can migrate to delegating into the core gradually, with no flag day.

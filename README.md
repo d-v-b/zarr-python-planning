@@ -2,6 +2,10 @@
 
 Plans for the future of Zarr-Python.
 
+## Who we are
+
+This document is written by the [zarr-python core developers](https://github.com/zarr-developers/zarr-python). The proposals below are our shared assessment of the project's direction; the work to deliver them will run through the normal Zarr-Python development process — public discussion on the proposals, PRs against the [`zarr-developers/zarr-python`](https://github.com/zarr-developers/zarr-python) repository, and the existing release cadence.
+
 ## Audience
 
 This planning document is for two audiences. The first is Zarr developers and contributors evaluating where the project should go next. The second is funders, institutional partners, and stakeholders who care about Zarr's success in the scientific Python ecosystem but don't follow the codebase day-to-day. The README is the entry point for both; individual proposal documents under `proposals/` go deeper for developers and reviewers.
@@ -73,7 +77,29 @@ The V3 work was a necessity-driven rewrite under hard backwards-compatibility co
 
 That trade-off — features and compatibility first, internals later — was defensible for a long time. As the ecosystem matures, the calculus has flipped. The dependency-footprint workarounds documented in the proposals below, the bespoke external package required for Zarrs integration, the recurring bugs in path handling and async layering all share one root cause: the internals were never designed, they accreted. The accumulated cost of working around them now exceeds the cost of paying them down.
 
-The 4.0 work proposed here is that overdue investment. The user-facing API does not change.
+The 4.0 work proposed here is that overdue investment.
+
+### What we do and don't commit to for backwards compatibility
+
+A 4.0 release is a breaking-change release. We are **not** making a blanket backwards-compatibility commitment for the public API: methods will be renamed, signatures will change, deprecated patterns will be removed, the codec and store APIs will be rewritten. The 2.x → 3.x transition was carried out under hard backwards-compatibility constraints; the 4.0 transition is the one where we get to fix what those constraints prevented us from fixing.
+
+What we *do* commit to:
+
+- **Conformance with community standards.** Where there is a relevant cross-language standard, Zarr-Python 4.0 conforms to it: the [Python Array API](https://data-apis.org/array-api/) at the array surface; the Zarr V3 spec and its extensions at the storage layer; OpenTelemetry for tracing; standard buffer-protocol and device-interop conventions (CUDA Array Interface, DLPack) for device-agnostic IO. Compatibility with the *standard* is a stronger guarantee than compatibility with a previous version of our own API, because it interoperates across the broader ecosystem.
+- **Functional coverage.** Anything you can do in Zarr-Python 3.x you can do in Zarr-Python 4.x — typically *better*, sometimes through a renamed API, but the underlying capability is preserved. We will not silently remove the ability to read or write any Zarr-format data that 3.x supports. Where the API changes, the migration is documented and the change is justified by a concrete improvement.
+- **A deprecation window.** Renames and removals land through one or more deprecation cycles. The aggressive default-flip in lazy indexing (eager → lazy) is the most visible example: opt-in lazy in 4.0, default flip in a later 4.x release, eager removal in 5.0. Downstream libraries (Xarray, Dask, napari) get release windows to absorb each change before the next one lands.
+
+The honest framing: **the API is going to change, and we believe the changes are worth the cost.** Downstream maintainers should expect to update their code; the 4.0 transition is not a no-op for them. We commit to making each change worthwhile and to giving downstream time to adapt — not to preserving every method signature.
+
+## What could derail this
+
+Two scenarios would invalidate the case above. Both are real; neither is hypothetical.
+
+**Zarr is supplanted by a new data format emerging from the ML world.** The format-design pressure from ML workloads — checkpoint-shaped IO, tensor-native types, GPU-resident buffers, single-writer atomicity — is producing new and competing storage formats faster than at any point in Zarr's history. If one of them displaces Zarr as the default for large-scale scientific arrays, the institutional dependencies catalogued below shift onto a different substrate and the 4.0 work becomes maintenance of a fading library. The mitigation is in the proposal itself: the 4.0 work explicitly targets the gaps (ML dtypes, device-agnostic IO, distributed checkpointing via TensorStore-engine wrapping) that would make a competing format necessary. If we ship Phase 0 and Phase 1, Zarr stays competitive on the workloads that would otherwise drive a replacement.
+
+**Zarr-Python is abandoned in favor of TensorStore, zarrs, or a more agile Python library.** This is the failure mode the both-and framing is designed against. If Zarr-Python's pure-Python mode is too slow, too awkward, or too hard to extend, performance-sensitive users move to TensorStore via its Python bindings, and the long tail of small Zarr-using tools either follows or routes around Zarr-Python ad hoc (which is already happening — `yaozarrs`, `mesh-n-bone`, etc.). The mitigation, again, is the work itself: the proposals deliver the performance, extensibility, and ergonomics that make Zarr-Python worth choosing over the alternatives, and the engine-wrapping work means users who *do* need TensorStore's throughput get it without leaving the Zarr-Python ecosystem. If we *don't* ship Phase 1 — the pure-Python performance work — the alternative-library scenario becomes likely within one or two release cycles.
+
+Both risks point at the same conclusion: the 4.0 work is what keeps Zarr-Python relevant. Not doing it is not the safe option.
 
 ## Who funds and depends on this work
 
