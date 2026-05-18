@@ -129,7 +129,7 @@ The functional core gives us clean seams along which `zarr-python` can be split 
 
 ### The packages
 
-- `zarr-metadata` — pure data structures and parsers for Zarr V2 and V3 metadata documents. Also owns the **chunk-addressing** types — `ChunkGrid` (regular and Rectilinear), `ChunkKeyEncoding` (V2 and V3 variants, including future entries from `zarr-extensions`) — because they are pure-data descriptions consumed by both metadata parsing and chunk lookup. This is the package that grows when a new chunk grid or key encoding is specified, which is one of the README's 4.0 acceleration goals.
+- [`zarr-metadata`](https://github.com/zarr-developers/zarr-metadata) — **already shipped** ([on PyPI](https://pypi.org/project/zarr-metadata/)). Pure data structures and parsers for Zarr V2 and V3 metadata documents. Also owns the **chunk-addressing** types — `ChunkGrid` (regular and Rectilinear), `ChunkKeyEncoding` (V2 and V3 variants, including future entries from `zarr-extensions`) — because they are pure-data descriptions consumed by both metadata parsing and chunk lookup. This is the package that grows when a new chunk grid or key encoding is specified, which is one of the README's 4.0 acceleration goals. The other three packages below follow the same pattern.
 - `zarr-dtype` — Zarr data type system.
 - `zarr-codec` — the codec interface (no concrete codec implementations). Defines the `Codec` protocol family, `recommended_concurrency`, `PartialDecodeCapability`, `decode_into`, and so on. Codec implementations live in `zarr-python` or in third-party packages that depend on `zarr-codec`.
 - `zarr-store` — the store interface (capability protocols).
