@@ -28,24 +28,9 @@ The protocol below addresses both, by following TensorStore's two-knob model rat
 
 ### `Put` returns `PutResult`
 
+`Put.put` is defined in [stores-api.md § Capability protocols](./stores-api.md#capability-protocols). The signature and return shape are reproduced here for convenience:
+
 ```python
-@dataclass(frozen=True, slots=True)
-class PutResult:
-    """Returned from a successful Put operation. The generation is an
-    opaque, per-key, backend-defined token that uniquely identifies
-    the post-write state of the key. Backends without a notion of
-    object identity (e.g., MemoryStore prior to a generation counter
-    being added) leave it None.
-
-    `applied=False` means a conditional write's precondition failed.
-    The generation field reports the *current* generation in that
-    case, so callers can compare to what they expected and decide
-    whether to retry."""
-
-    generation: "Generation | None" = None
-    applied: bool = True
-
-
 @runtime_checkable
 class Put(Protocol):
     def put(
@@ -56,9 +41,17 @@ class Put(Protocol):
         if_match: "Generation | None" = None,
         if_none_match: bool = False,
     ) -> PutResult: ...
+
+# PutResult, also in stores-api.md:
+#   generation: Generation | None = None
+#   applied: bool = True
+# - applied=False = conditional precondition failed; generation reports
+#   the current backend generation.
+# - generation=None with applied=True = backend has no object identity
+#   (cannot support conditional writes).
 ```
 
-`Generation` is an opaque type — a string, bytes, an int, an ETag, an IceChunk content-hash. zarr-python treats it as `object` whose only operation is equality. Concrete backends define their own `Generation` representation; the protocol does not constrain the wire form.
+`Generation` is an opaque type — a string, bytes, an int, an ETag, an IceChunk content-hash. zarr-python treats it as `object` whose only operation is equality. Concrete backends define their own `Generation` representation; the protocol does not constrain the wire form. The canonical definition is in [stores-api.md](./stores-api.md#capability-protocols).
 
 `if_match=g` requires the current key's generation to equal `g`; if not, the put returns `PutResult(generation=current_g, applied=False)` without raising. `if_none_match=True` requires the key to be absent; if the key exists, same behavior — returns the current generation, `applied=False`. Both flags compose only with each other (`if_match=` requires the key to exist; `if_none_match=True` requires absence). Mutual exclusion is enforced by the wrapper at call time.
 
@@ -66,25 +59,21 @@ This contract matches TensorStore's `KvStore.write(key, value, if_equal=...)`, w
 
 ### `Get` returns `ReadResult`
 
+`Get.get` is defined in [stores-api.md § Capability protocols](./stores-api.md#capability-protocols). The signature and return shape are reproduced here for convenience:
+
 ```python
-@dataclass(frozen=True, slots=True)
-class ReadResult:
-    """Returned from a successful Get operation. Carries the value and
-    the generation token at the time of the read. Backends without
-    generations leave the field None."""
-
-    value: memoryview
-    generation: "Generation | None" = None
-
-
 @runtime_checkable
 class Get(Protocol):
     def get(self, key: str, *, if_not_match: "Generation | None" = None) -> ReadResult: ...
+
+# ReadResult, also in stores-api.md:
+#   value: memoryview
+#   generation: Generation        # opaque; equality is the only operation
 ```
 
 `if_not_match=g` is a cache-validation primitive: if the current generation matches `g`, the read returns `ReadResult(value=memoryview(b''), generation=g)` with no payload. Modeled directly on TensorStore's `KvStore.read(key, if_not_equal=...)`. Useful for `Caching[S]` revalidation against a backend that supports generations.
 
-This is a structural change from the [Stores API proposal](./stores-api.md) where `Get.get` returns `memoryview` directly. The migration is straightforward: existing call sites that use the bytes get `result.value`. The advantage is that the generation is available at every read site without a follow-up `head()` call, which is the foundation for the conditional-write story.
+`ReadResult` is the canonical return shape across the stores cluster (see [stores-api.md § Capability protocols](./stores-api.md#capability-protocols)). The advantage of this shape is that the generation is available at every read site without a follow-up `head()` call, which is the foundation for the conditional-write story below.
 
 ### Per-backend support for generations
 

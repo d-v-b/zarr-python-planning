@@ -1,8 +1,8 @@
 # Codecs
 
-> Theme proposal. For the high-level pitch, see the [parent README](../README.md). See also [packaging.md](./packaging.md) for the packaging side of the codec story.
+> Theme proposal. For the high-level pitch, see the [parent README](../README.md). See also [functional-core.md](./functional-core.md#concrete-packaging-plan) for the packaging side of the codec story.
 
-In addition to the packaging issues addressed in [packaging.md](./packaging.md#case-study-codecs), there are a few other pain points related to codecs that we should fix as part of a Zarr Python 4.0 effort:
+In addition to the packaging issues addressed in [functional-core.md](./functional-core.md#case-study-breaking-the-codec-circular-dependency), there are a few other pain points related to codecs that we should fix as part of a Zarr Python 4.0 effort:
 
 - The Zarr Python codec API is unwieldy and inefficient.
 - Many popular Zarr V2 codecs have no Zarr V3 equivalent.
@@ -73,13 +73,23 @@ Solution: add `encode_into` and `decode_into` methods that don't allocate output
 
 When we request 1 scalar from an NxM chunk, we allocate memory for the entire chunk, read and decode the entire chunk, then select the single requested scalar. This is inefficient, compared to pushing the selection down into the chunk decoding process. 
 
-Solution: Formally represent how array -> array codecs transform array indices, and index scalars from arrays mid-decoding as soon as they are available. This would offer a massive reduction in memory use for sub-chunk indexing workloads.
+Solution: introduce a `PartialDecodeCapability` flag on every codec — a pair `{ partial_read: bool, partial_decode: bool }` — that advertises whether the codec can be asked to decode a sub-selection without materializing the full output. Codecs that can (transpose, identity dtype transforms) advertise `partial_decode=True`; codecs that cannot (blosc, gzip, anything stateful) advertise `partial_decode=False`. The pipeline reads these flags to decide whether to push a selection down into a chunk decode or fall back to whole-chunk decode plus post-selection. See [performance.md § 7](./performance.md#7-internal-pipeline-caches-between-non-partial-decode-codecs) for the pipeline-level consequences.
 
-### Codecs don't cache
+This also formally represents how array → array codecs transform array indices, so the pipeline can index scalars mid-decoding as soon as they are available. Combined, these give a substantial reduction in memory use for sub-chunk indexing workloads.
 
-When the codec pipeline decodes a chunk, it throws that decoded chunk away. This means requesting the same chunk again will trigger the same compute, which is wasteful if the data hasn't changed.
+### The codec pipeline caches automatically; codecs do not
 
-Solution: Array -> Array codecs that decode a full chunk should cache that decoded chunk, and re-use it later when subslices are requested. This is something Zarrs does. Combined with giving codecs a model of array selection (slicing) we can get a huge reduction in compute by spending some memory on a cache.
+When the codec pipeline decodes a chunk through a codec that lacks partial-decode support (blosc, gzip), the pipeline today re-runs the full decode on every sub-selection of the same chunk. Wasteful for fancy-indexing workloads.
+
+Solution: the pipeline (not individual codecs) inserts an internal cache at each non-partial-decode codec — a `PartialDecoderCache` whose lifetime is **per-call** (one full decode reused across the partial reads within one request). On the next user request, the cache is gone. This matches `zarrs`'s `CodecChain::new` behavior and the contract in [performance.md § Default caching policy](./performance.md#default-caching-policy) (where the partial-decoder cache is "On, automatic, per-call lifetime, no user surface").
+
+Cross-call decoded-chunk caching is a separate concern, handled at the array layer (above the codec pipeline) — see the catalog and placement diagram in [performance.md § Caching](./performance.md#caching), specifically the *decoded chunk cache* row. Encoded-chunk bytes are cached at the store layer instead ([stores-caching.md](./stores-caching.md)). Codecs themselves remain stateless.
+
+### Codecs report their parallelism budget
+
+Per [performance.md § 1](./performance.md#1-concurrency-is-typed-library-owned-and-shared-across-nested-calls), the library owns typed concurrency resources (`ComputeConcurrency`, `IoConcurrency`) rather than letting every layer spawn threads independently. The codec API surface needed for the *vertical* axis — propagating a budget through the call stack — is `recommended_concurrency() -> RecommendedConcurrency` on every codec: a `{ min: int, max: int }` range describing how much per-codec parallelism the codec can productively use on a given input shape. The pipeline aggregates these ranges and the call's current budget slice (taken from `ComputeConcurrency`) and splits the budget between outer (chunk-level) and inner (codec-level) parallelism such that `outer × inner ≤ target`. The budget strictly shrinks as the call descends; the typed pool's admission queue handles cross-call coordination.
+
+This is the difference between today's "blosc spawns N threads × sharding spawns M threads × chunks spawn P threads" thread explosion and a bounded total. It is the single highest-leverage performance change in the 4.0 set. The codec-side API surface is `recommended_concurrency()` on the base protocol; the library-side machinery (the typed resources and the `calc_concurrency_outer_inner`-equivalent splitter) is in [performance.md § 1](./performance.md#1-concurrency-is-typed-library-owned-and-shared-across-nested-calls).
 
 ### We should learn from Zarrs and Tensorstore
 
@@ -93,7 +103,7 @@ Today, we tell people with serious performance demands to use Tensorstore or Zar
 
 In the Zarr Python 2.x era, the codec API was extremely simple. Zarr Python got all of its codecs from Numcodecs, which was a separate package due to the special build requirements involved with Cython code. Codecs were also unspecified, which was bad: Zarr developers working in other languages had to study the Numcodecs source code instead of a spec to replicate some of these codecs.
 
-The Zarr V3 spec changed things for the better. Codecs got richer semantics and specification documents. But we never updated Numcodecs to natively support Zarr V3 codecs, in part because the Zarr Python 3.x codec implementation depended on a lot of Zarr Python internals. In retrospect this should have been addressed immediately by spinning out these dependencies into logically separated packages (see [the packaging case study](./packaging.md#case-study-codecs)).
+The Zarr V3 spec changed things for the better. Codecs got richer semantics and specification documents. But we never updated Numcodecs to natively support Zarr V3 codecs, in part because the Zarr Python 3.x codec implementation depended on a lot of Zarr Python internals. In retrospect this should have been addressed immediately by spinning out these dependencies into logically separated packages (see [the packaging case study](./functional-core.md#case-study-breaking-the-codec-circular-dependency)).
 
 There's no direct translation from a Zarr V2 codec to a Zarr V3 codec, which leaves many Zarr V2 codecs that lack a complete Zarr V3 counterpart.
 

@@ -29,7 +29,7 @@ Given a `get_ranges(key, *, starts, ends=None, lengths=None)` call on the wrappe
    - `(s2 + l2) - group_start <= max_request` (adding this range would not exceed the per-request size budget).
    Otherwise, this range starts a new group.
 4. **Issue one `inner.get_range(key, start=group_start, length=group_length)` per group.** The wrapper does not parallelize across groups by default; that is the responsibility of the caller (e.g., the codec pipeline, which already issues concurrent fetches across keys).
-5. **Slice each coalesced result into per-range views and assemble the output in original input order.** Each output is a `memoryview` over the relevant slice of the coalesced fetch. Because the result is a `memoryview` per the [return-type subsection](../README.md#returning-memoryview-from-store-read-methods), per-range slicing is zero-copy.
+5. **Slice each coalesced result into per-range views and assemble the output in original input order.** Each output is a `ReadResult` whose `value` is a `memoryview` over the relevant slice of the coalesced fetch; all results in one batch share the same `generation` (they came from one underlying object read). Per-range slicing is zero-copy on `memoryview`.
 
 ```python
 # Pseudocode for the coalescing core. Real implementation lives in
@@ -55,14 +55,19 @@ def get_ranges(self, key, *, starts, ends=None, lengths=None):
         else:
             groups.append([(orig_idx, (start, length))])
 
-    out: list[memoryview | None] = [None] * n
+    out: list[ReadResult | None] = [None] * n
     for group in groups:
         group_start = group[0][1][0]
         group_end = max(s + l for _, (s, l) in group)
-        coalesced = self._inner.get_range(key, start=group_start, length=group_end - group_start)
+        coalesced = self._inner.get_range(
+            key, start=group_start, length=group_end - group_start
+        )
         for orig_idx, (s, l) in group:
             offset = s - group_start
-            out[orig_idx] = coalesced[offset : offset + l]
+            out[orig_idx] = ReadResult(
+                value=coalesced.value[offset : offset + l],
+                generation=coalesced.generation,
+            )
 
     return out  # type: ignore[return-value]  # no None left after the loop
 ```
@@ -143,7 +148,7 @@ The PR's range-coalescing logic should be reviewable against this proposal as th
 
 - **Method names and signatures.** The PR is async and would land into the eventual `GetRangesAsync` protocol with method `get_ranges_async`. The coalescing logic itself is async-flavored; the algorithm above translates verbatim with `await`.
 - **Defaults.** Whatever the PR ships should match (or document divergence from) the `1 MiB / 64 MiB` defaults proposed here. Wildly different defaults invite future churn when the wrapper protocol lands and someone notices the inconsistency.
-- **Return type.** The result should be `Sequence[memoryview]` per the [return-type subsection](../README.md#returning-memoryview-from-store-read-methods); slicing the coalesced fetch is naturally zero-copy on `memoryview`. If the PR currently returns zarr `Buffer` objects, that is the one decision the migration plan flips later.
+- **Return type.** The result is `Sequence[ReadResult]` per the [stores-api.md protocol surface](./stores-api.md#capability-protocols); each `ReadResult.value` is a `memoryview` over the relevant slice of the coalesced fetch (zero-copy), and all results share the same `generation`. If the PR currently returns zarr `Buffer` objects, that is the one decision the migration plan flips later.
 - **Native `get_ranges` short-circuit.** The PR should either (a) not wrap stores that already implement native batch fetching, or (b) detect the inner capability and short-circuit. Wrapping `ObstoreStore` (which has native `get_ranges`) and paying the coalescing logic's per-call overhead would be a net loss.
 - **Failure semantics.** The PR's behavior on partial backend errors should match the all-or-nothing contract spelled out above. Per-range partial success is a follow-up, not initial scope.
 - **Conformance test inheritance.** The PR adds a backend-specific test file that subclasses `RangeCoalescingSpec` (once the conformance suite ships) and provides fixtures that exercise the wrapper against a `GetRange`-only mock. Until the conformance suite lands, the PR's tests should at least include the load-bearing assertions (single underlying call when ranges are within `max_gap`, ordering preservation, partial-failure raise) so future migration to the spec is mechanical.

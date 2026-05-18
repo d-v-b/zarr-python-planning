@@ -37,7 +37,7 @@ src/zarr/storage/testing/
         list.py            # ListSpec, ListWithDelimiterSpec
         head.py            # HeadSpec
         copy.py            # CopySpec
-        transactional.py   # TransactionalSpec, TransactionalOCCSpec
+        transactional.py   # TransactionalSpec (covers both atomic= and repeatable_read= knobs)
     asynchronous/          # mirrors `sync/` with async fixtures and `_async` method names
         get.py             # GetAsyncSpec
         ...
@@ -74,11 +74,14 @@ class GetSpec:
         override and pre-populate their backing some other way."""
         raise NotImplementedError("subclasses must provide a `populated` fixture")
 
-    def test_get_returns_memoryview(self, store: Get, populated: tuple[str, bytes]) -> None:
+    def test_get_returns_readresult(self, store: Get, populated: tuple[str, bytes]) -> None:
         key, value = populated
         result = store.get(key)
-        assert isinstance(result, memoryview)
-        assert bytes(result) == value
+        assert isinstance(result, ReadResult)
+        assert isinstance(result.value, memoryview)
+        assert bytes(result.value) == value
+        # `result.generation` is opaque; equality is the only operation.
+        assert result.generation == store.get(key).generation
 
     def test_get_missing_key_raises_keyerror(self, store: Get) -> None:
         with pytest.raises(KeyError):
@@ -136,7 +139,8 @@ This section enumerates the spec classes and lists the assertions each one makes
 
 ### `GetSpec`
 
-- `test_get_returns_memoryview` (sketched above).
+- `test_get_returns_readresult` (sketched above).
+- `test_get_revalidate_returns_same_generation`. `store.get(key, if_not_match=prior_gen)` returns either `ReadResult(value=..., generation=prior_gen)` (semantic: "unchanged, here's the cached value") or raises `NotModified` — backends pick one; the spec asserts whichever they declare.
 - `test_get_missing_key_raises_keyerror`.
 - `test_get_does_not_mutate_store`.
 - `test_get_supports_nested_keys`. Uses keys with `/` separators.
@@ -148,14 +152,14 @@ This section enumerates the spec classes and lists the assertions each one makes
 - `test_get_range_with_start_and_end`.
 - `test_get_range_with_start_and_length`.
 - `test_get_range_end_and_length_mutually_exclusive`. Either both raise or one is preferred; the spec pins the choice.
-- `test_get_range_zero_length`. Returns an empty `memoryview`, not `None`.
+- `test_get_range_zero_length`. Returns a `ReadResult` whose `value` is an empty `memoryview`, not `None`.
 - `test_get_range_past_end_truncates_or_raises`. Backends document which; the spec asserts whichever they declare.
 - `test_get_range_negative_indices_raise`. Negative indices are not allowed in obspec's signature; we follow.
 - `test_get_range_missing_key_raises_keyerror`.
 
 ### `GetRangesSpec`
 
-- `test_get_ranges_returns_sequence_of_memoryview`.
+- `test_get_ranges_returns_sequence_of_readresult`. Each element is a `ReadResult`; all elements share the same `generation` (they came from one underlying object read).
 - `test_get_ranges_preserves_order`. Output order matches input order even if the backend reorders internally for coalescing.
 - `test_get_ranges_empty_input_returns_empty_output`.
 - `test_get_ranges_single_range_matches_get_range`. Calling `get_ranges(key, starts=[s], ends=[e])` returns the same bytes as `[get_range(key, start=s, end=e)]`.
@@ -165,7 +169,12 @@ This section enumerates the spec classes and lists the assertions each one makes
 
 - `test_put_round_trip` against `Get`.
 - `test_put_overwrite`. Putting the same key twice replaces.
-- `test_put_accepts_bytes_and_memoryview`. Both input types succeed; result identical.
+- `test_put_accepts_bytes_and_memoryview`. Both input types succeed; both return `PutResult(applied=True, generation=<token>)` (or `generation=None` on backends with no object identity) and the round-tripped bytes match.
+- `test_put_if_match_succeeds_on_match`. `store.put(key, new, if_match=prior_gen)` returns `PutResult(applied=True, generation=<new_token>)` (different from `prior_gen`) when the precondition holds.
+- `test_put_if_match_fails_on_mismatch`. The same call returns `PutResult(applied=False, generation=<current_token>)` when the precondition fails; the stored value is unchanged. `<current_token>` is the live generation of the key, so the caller can decide whether to retry.
+- `test_put_if_none_match_succeeds_on_absent`. `store.put(key, value, if_none_match=True)` on an absent key returns `PutResult(applied=True, ...)`.
+- `test_put_if_none_match_fails_on_present`. The same call on a present key returns `PutResult(applied=False, ...)`; the stored value is unchanged.
+- `test_put_if_match_on_backend_without_generations_raises_typeerror`. Backends without object identity raise `TypeError` rather than silently ignoring the precondition.
 - `test_put_with_nested_key_creates_intermediate_structure`. For backends with directory semantics; no-op for others.
 
 ### `DeleteSpec`
@@ -212,7 +221,7 @@ The full eight-test sketch and the four-test extension for OCC backends are in [
 - `test_atomic_multi_key`. A multi-`put` transaction either commits all keys or none.
 - `test_per_key_atomicity_no_torn_write`. Single-key writes are observed as either old or new value, never a partial. Skipped on backends that document the limitation (`ZipStore`).
 
-A separate `TransactionalOCCSpec` extends `TransactionalSpec` for backends that advertise `TransactionalOCC` (Icechunk and similar). It tests `ConflictError` semantics, version round-trip, and that conflict-failed transactions do not leak writes.
+Snapshot-isolation tests are part of `TransactionalSpec` itself, gated on backends that support `Transaction(atomic=True, repeatable_read=True)` (Icechunk and similar). Tests cover `TransactionFailed` conflict semantics, generation round-trip on writes, and that conflict-failed transactions do not leak writes. The earlier `TransactionalOCCSpec` design is retired now that the protocol no longer has a separate OCC variant — see [stores-transactional.md](./stores-transactional.md).
 
 ### Async specs
 
@@ -248,7 +257,7 @@ class CapabilityPreservationSpec:
 Each wrapper has its own spec class with wrapper-specific assertions. These extend the conformance specs (so the wrapped store must still satisfy `GetSpec`, `GetRangeSpec`, etc. when the underlying store does) and add wrapper-specific tests.
 
 - **`ReadOnlySpec`**. `wrapped.put(...)` raises a documented exception type at runtime; `isinstance(wrapped, Put)` is `False`; type-checker rejection is asserted via a separate `mypy --strict` test fixture.
-- **`CachingSpec`**. Cold read fetches from inner; warm read does not (asserted via a counting inner-store mock); writes invalidate the cache; eviction by `max_bytes` and `max_entries` and `ttl` each have a dedicated test. The full algorithm, defaults, write-invalidation contract, negative-caching semantics, and the fourteen specific tests this spec runs are specified in [stores-caching.md](./stores-caching.md), including the recommended composition order with `RangeCoalescing` (caching outermost, coalescing below) and the migration plan from `experimental.cache_store`.
+- **`CachingSpec`**. Cold read fetches from inner; warm read does not (asserted via a counting inner-store mock); writes invalidate the cache; eviction by per-tier byte budgets and `max_entries` and `ttl` each have a dedicated test. The full algorithm, defaults, write-invalidation contract, negative-caching semantics, the three-tier toggles (`metadata`, `chunks`, `negative`), and the full list of tests this spec runs are specified in [stores-caching.md](./stores-caching.md), including the recommended composition order with `RangeCoalescing` (caching outermost, coalescing below) and the migration plan from `experimental.cache_store`.
 - **`RangeCoalescingSpec`**. The most important one for #3925: `RangeCoalescing[S]` synthesizes `GetRanges` for an `S` that only implements `GetRange`; the test asserts that calling `wrapped.get_ranges(key, starts=[0, 100], ends=[50, 150])` issues exactly one underlying `get_range(key, start=0, end=150)` call and slices the result, when `max_gap >= 50` and `max_request >= 150`. Negative cases assert non-coalescable inputs do issue separate calls. The full algorithm, defaults, failure semantics, and the nine specific tests this spec runs are specified in [stores-range-coalescing.md](./stores-range-coalescing.md), including the empirically-verified `__new__` short-circuit pattern that lets the wrapper be a no-op when `S` already implements `GetRanges` natively.
 - **`SyncToAsyncSpec`** / **`AsyncToSyncSpec`**. Each capability the inner store advertises gets a sync/async mirror on the wrapped store; round-trip semantics match.
 - **`RetrySpec`**. Retries on documented transient exception types up to `max_attempts`; gives up afterward; passes other exceptions through unmodified.

@@ -32,10 +32,49 @@ This is a 4.0-shaped sketch. The migration story at the end describes how to get
 
 from typing import Protocol, runtime_checkable
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
+
+# `Generation` is the per-key, opaque, backend-produced token that
+# identifies a particular state of a key. ETag for HTTP backends, mtime
+# for filesystems, a snapshot id for transactional backends. Treated as
+# `object` at the protocol layer; equality is the only operation defined
+# on it. See stores-transactional.md for the full contract.
+Generation = object
+
+@dataclass(frozen=True)
+class ReadResult:
+    """The return value of `Get.get` and friends. Carries the value plus
+    the key's current generation so callers can revalidate cheaply with
+    `if_not_match=` on a subsequent read."""
+    value: memoryview
+    generation: Generation
+
+@dataclass(frozen=True)
+class PutResult:
+    """The return value of `Put.put`. Carries the post-write generation
+    so callers can chain conditional writes (`if_match=prior.generation`)
+    without re-reading the key.
+
+    `applied=False` means a conditional write's precondition failed.
+    In that case `generation` reports the *current* generation of the
+    key (so the caller can compare to what they expected and decide
+    whether to retry), and the stored value is unchanged.
+
+    `generation=None` with `applied=True` means the backend has no
+    notion of object identity (e.g. a barebones `MemoryStore` with no
+    generation counter). Such backends cannot support conditional
+    writes; they raise `TypeError` if `if_match=` is provided."""
+    generation: Generation | None = None
+    applied: bool = True
 
 @runtime_checkable
 class Get(Protocol):
-    def get(self, key: str) -> memoryview: ...
+    def get(
+        self,
+        key: str,
+        *,
+        if_not_match: Generation | None = None,
+    ) -> ReadResult: ...
 
 @runtime_checkable
 class GetRange(Protocol):
@@ -46,13 +85,16 @@ class GetRange(Protocol):
         start: int,
         end: int | None = None,
         length: int | None = None,
-    ) -> memoryview: ...
+        if_not_match: Generation | None = None,
+    ) -> ReadResult: ...
 
 @runtime_checkable
 class GetRanges(Protocol):
     """Batch range read. Backends that support this natively (S3 cat_ranges,
     obstore get_ranges) advertise it; a `RangeCoalescing` wrapper synthesizes
-    it for backends that only have `GetRange`."""
+    it for backends that only have `GetRange`. Returns one `ReadResult` per
+    requested range; all results share the same generation since they come
+    from the same underlying object read."""
     def get_ranges(
         self,
         key: str,
@@ -60,15 +102,28 @@ class GetRanges(Protocol):
         starts: Sequence[int],
         ends: Sequence[int] | None = None,
         lengths: Sequence[int] | None = None,
-    ) -> Sequence[memoryview]: ...
+        if_not_match: Generation | None = None,
+    ) -> Sequence[ReadResult]: ...
 
 @runtime_checkable
 class Put(Protocol):
-    def put(self, key: str, value: bytes | memoryview) -> None: ...
+    def put(
+        self,
+        key: str,
+        value: bytes | memoryview,
+        *,
+        if_match: Generation | None = None,
+        if_none_match: bool = False,
+    ) -> PutResult: ...
 
 @runtime_checkable
 class Delete(Protocol):
-    def delete(self, key: str) -> None: ...
+    def delete(
+        self,
+        key: str,
+        *,
+        if_match: Generation | None = None,
+    ) -> None: ...
 
 @runtime_checkable
 class List(Protocol):
@@ -94,12 +149,99 @@ class Copy(Protocol):
 class Transactional(Protocol):
     """Multi-key atomic transactions. Backends advertise this when
     they support batching writes into an atomic commit. Per-key
-    atomicity is a property of `Put` and not require this protocol.
+    atomicity and conditional writes are properties of `Put` (via
+    `if_match`) and do not require this protocol.
 
-    Algorithm, per-backend support matrix, OCC extension via
-    `TransactionalOCC`, composition rules with other wrappers, and
-    the test plan are in [stores-transactional.md](./stores-transactional.md)."""
-    def transaction(self) -> "TransactionContext": ...
+    Adopts TensorStore's external-transaction model: a free-standing
+    `Transaction` object is bound to a store with `store.with_transaction(txn)`,
+    which returns a view of the store whose writes flow into `txn`.
+    Two boolean knobs (`atomic` and `repeatable_read`) on `Transaction`
+    span the isolation/atomicity space.
+
+    Full design (Transaction object, repeatable-read semantics, per-backend
+    support matrix, composition rules) is in
+    [stores-transactional.md](./stores-transactional.md)."""
+    def with_transaction(self, txn: "Transaction") -> "Self": ...
+
+@runtime_checkable
+class Serializable(Protocol):
+    """The store can produce a portable declaration of itself — enough
+    *configuration* for a different process (or a different language
+    runtime) to reconstruct an equivalent store pointing at the same
+    backend. This is store identity and connection info (an S3 URL with
+    credential reference, a filesystem path, an fsspec URL plus storage
+    options), not the contents of the store. The store's data lives
+    where it always lived; the declaration just describes how to talk
+    to it.
+
+    Required for cross-engine portability: alternative engines like
+    `zarr.engines.zarrs` and `zarr.engines.tensorstore` run in native
+    code (or via FFI), so they need to materialize their own equivalent
+    of the user's store on the other side of the language boundary.
+    See [functional-core.md § The direction](./functional-core.md#the-direction)
+    and [performance.md § Wrapping zarrs and TensorStore as alternative engines](./performance.md#wrapping-zarrs-and-tensorstore-as-alternative-engines).
+
+    Also useful for pickling stores across Dask workers, persisting
+    store configuration in URL form, and round-tripping store identity
+    in test fixtures.
+
+    The method names `to_declaration` / `from_declaration` here are
+    illustrative. What this proposal commits to is the *capability* —
+    "stores can serialize their identity and configuration to a portable
+    data format that another runtime can reconstruct from" — not the
+    spelling. The final method names, the exact shape of
+    `StoreDeclaration`, and the registration mechanism for reconstructing
+    a store from one are open questions to be settled at implementation
+    time."""
+
+    def to_declaration(self) -> "StoreDeclaration": ...
+
+    @classmethod
+    def from_declaration(cls, declaration: "StoreDeclaration") -> "Self": ...
+
+@dataclass(frozen=True)
+class StoreDeclaration:
+    """Portable description of a store's identity and connection
+    configuration. Sketch; the field set is illustrative.
+
+    - `kind` identifies the backend type (e.g. `"local"`, `"s3"`,
+      `"memory"`, `"zip"`, `"fsspec"`).
+    - `config` is the backend-specific reconstruction payload, keyed by
+      `kind`. For `"local"`, the path; for `"s3"`, the bucket plus
+      region plus prefix plus credential reference; for `"fsspec"`, the
+      URL plus storage options. Must be JSON-round-trippable.
+
+    This describes *how to connect* to a store, not the data in the
+    store. Per-key contents and per-key generations are unrelated; this
+    is store-identity-as-data.
+
+    Alignment with [obstore's URL+config pattern](https://developmentseed.org/obstore/)
+    and TensorStore's [Spec](https://google.github.io/tensorstore/spec/index.html)
+    is the target; the exact shape will be specified once one external
+    engine integration drives the field set."""
+
+    kind: str
+    config: dict[str, object]
+
+@dataclass
+class ListResult:
+    """The return value of `ListWithDelimiter.list_with_delimiter`.
+    `objects` are the keys directly under `prefix`; `prefixes` are
+    common-prefix strings that name "subdirectory"-style groupings."""
+    objects: Sequence[str]
+    prefixes: Sequence[str]
+
+@dataclass(frozen=True)
+class ObjectMetadata:
+    """The return value of `Head.head`. Subset of cloud-store object
+    metadata that is portable across S3/GCS/Azure/local.
+
+    `generation` is the per-key opaque token; `size_bytes` is the
+    object's length in bytes; `last_modified` is a UNIX timestamp in
+    seconds, or `None` if the backend doesn't track it."""
+    generation: Generation
+    size_bytes: int
+    last_modified: float | None
 
 # Async variants (`GetAsync`, `GetRangeAsync`, `GetRangesAsync`, `PutAsync`,
 # `DeleteAsync`, `ListAsync`, `ListWithDelimiterAsync`, `HeadAsync`,
@@ -109,17 +251,17 @@ class Transactional(Protocol):
 # See the README's sync-by-default subsection for the per-backend mapping.
 ```
 
-## GPU, zero-copy, and streaming reads via `GetStreaming`
+## Streaming and caller-allocated reads via `GetStreaming`
 
-`Get`, `GetRange`, and `GetRanges` follow an allocation-based contract: the store allocates the result buffer, fills it, and returns it. This is the right shape for the common case (small CPU reads from CPU-shaped backends) and matches every role-model storage API: TensorStore's `KvStore.read` allocates ([KvStore.read](https://google.github.io/tensorstore/python/api/tensorstore.KvStore.read.html)), zarrs's `ReadableStorageTraits::get` allocates ([ReadableStorageTraits](https://docs.rs/zarrs_storage/latest/zarrs_storage/trait.ReadableStorageTraits.html)), zarrita's `Readable.get` allocates, obstore's `get` allocates.
+`Get`, `GetRange`, and `GetRanges` follow an allocation-based contract: the store allocates the result buffer, fills it, and returns it. This is the right shape for the common case (small reads where the store knows the size up front) and matches every role-model storage API: TensorStore's `KvStore.read` allocates ([KvStore.read](https://google.github.io/tensorstore/python/api/tensorstore.KvStore.read.html)), zarrs's `ReadableStorageTraits::get` allocates ([ReadableStorageTraits](https://docs.rs/zarrs_storage/latest/zarrs_storage/trait.ReadableStorageTraits.html)), zarrita's `Readable.get` allocates, obstore's `get` allocates.
 
 But the allocation-based contract leaves three problems on the table:
 
-1. **GPU-direct reads.** Today's `prototype: BufferPrototype` argument was an attempt to address this — by letting the caller specify "give me back a GPU buffer" — but the README's [decoupling-prototype subsection](../README.md#decoupling-prototype-from-the-read-api) admits the GPU path is fictional in current zarr-python: even with `gpu_buffer_prototype`, the bytes hit the CPU first because neither fsspec nor obstore knows how to allocate on the device. `prototype` is a knob that doesn't actually wire up.
+1. **Device-agnostic IO is fictional.** Today's `prototype: BufferPrototype` argument was an attempt to let the caller specify "give me back a buffer of this kind" — most visibly to support GPU destinations — but the [decoupling-prototype subsection in stores.md](./stores.md#decoupling-prototype-from-the-read-api) acknowledges that the non-CPU path doesn't actually wire up: even with `gpu_buffer_prototype`, bytes hit the CPU first because the store doesn't know how to allocate on the device. The right shape is the opposite: stop asking the store to allocate at all, and let the caller hand the store a destination buffer of whatever kind they want. See [gpu.md § Device-agnostic IO](./gpu.md) for the broader framing — GPU support is one application of this; CPU pre-allocated buffers (the most common use) is another.
 2. **Values that exceed memory.** A 100 GiB shard cannot be read into a `bytes`/`memoryview` in one shot. The current API forces the caller to use `GetRange` to manually pull slice-by-slice, which is awkward and loses any pipelining benefit the backend could offer.
 3. **Pipelined decode.** A network read of a multi-MiB shard delivers bytes incrementally over hundreds of milliseconds. The codec pipeline could start decoding the first chunk while the last chunk is still in flight. The one-shot `Get` blocks the caller from any of this; today's zarr-python collects the full payload before any downstream code runs.
 
-The honest design that addresses all three is a streaming protocol where the caller provides the destination buffer (CPU or GPU) and pumps chunks through. This is the shape zstd's streaming API takes ([zstd manual](https://facebook.github.io/zstd/zstd_manual.html), `ZSTD_decompressStream`): both ends are caller-owned, both have explicit cursors, the callee advances both. It is also the shape Python's `io.RawIOBase.readinto` takes for in-process streams.
+The honest design that addresses all three is a streaming protocol where the caller provides the destination buffer and pumps chunks through. The destination is whatever satisfies the buffer protocol (or the device-side equivalent — CUDA Array Interface, DLPack); the store does not introspect what kind of buffer it is. This is the shape zstd's streaming API takes ([zstd manual](https://facebook.github.io/zstd/zstd_manual.html), `ZSTD_decompressStream`): both ends are caller-owned, both have explicit cursors, the callee advances both. It is also the shape Python's `io.RawIOBase.readinto` takes for in-process streams.
 
 We adopt it for stores: `GetStreaming` returns a `ReadStream` that the caller drains chunk-by-chunk into a writable buffer. A `read_full(key, buffer)` convenience covers the one-shot case (caller knows the size up front) without duplicating the protocol family.
 
@@ -355,18 +497,29 @@ for chunk in decoder.flush():
 
 The decoder works on bytes as they arrive. End-to-end latency drops from "network full delivery + decode time" to "first chunk arrival + per-chunk decode time." This is what zarrs and TensorStore do internally; exposing it at the store layer in zarr-python lets the array/codec layers take advantage.
 
-### GPU-direct reads via streaming
+### Device-agnostic destinations (GPU as one example)
+
+The protocol does not care what kind of buffer the caller provides; it just calls `read_into` on whatever satisfies the buffer protocol (or the device-side equivalents — `__cuda_array_interface__`, `__dlpack__`). A CPU read into a pre-allocated `bytearray`, a CPU read into a numpy view of a larger output array, and a GPU read into a CuPy buffer are the same call shape:
 
 ```python
 import cupy as cp
 
+# CPU pre-allocated destination (the common case): no per-read allocation.
+buf = bytearray(shard_size)
+with store.get_streaming("c/0/0") as stream:
+    n = stream.read_full(buf)
+
+# GPU destination: same call, different buffer.
 buf = cp.empty(shard_size, dtype=cp.uint8)
 with gds_store.get_streaming("c/0/0") as stream:
     n = stream.read_full(buf)
-# The bytes were DMA'd directly into GPU memory. No CPU bounce.
+# A GDS-aware backend DMAs directly into GPU memory; backends without
+# device awareness fall back to "read into temp, memcpy into caller
+# buffer" with the documented copy. Either way, the protocol shape is
+# the same and the caller doesn't have to branch on device type.
 ```
 
-The protocol is unchanged from the CPU case; only the buffer's memory location differs. The backend (a future GDS-aware obstore variant) detects the CUDA buffer via `__cuda_array_interface__` and uses the device-direct path; backends that can't fall back to "read into temp, memcpy into caller buffer" with the documented copy.
+See [gpu.md](./gpu.md) for the broader framing of *why* the protocol is shaped this way — device-agnostic IO is the goal, and GPU support falls out as a consequence of stores accepting whatever buffer the caller provides.
 
 ### Backend support
 
@@ -386,7 +539,7 @@ Network backends (`ObstoreStore`, async `FsspecStore` over HTTP / S3 / GCS / Azu
 
 ### Composition with wrappers
 
-- **`Caching[GetStreaming]`**: works, with the cache capturing bytes as they flow through. The cache wraps `read_into` to write each chunk into both the caller's buffer and a cache-side buffer; on completion, the captured bytes are committed as a cache entry keyed by `(key,)`. Subsequent reads of the same key serve from the cache via `MemoryStore`-like streaming. This is the streaming-cache pattern; the [caching proposal](./stores-caching.md) is updated to reflect it. The earlier "Caching × GetInto refused at construction" decision is *resolved* here: streaming stores let the cache capture incrementally without breaking zero-copy.
+- **`Caching[GetStreaming]`**: the design is *resolvable* — streaming stores let the cache capture bytes incrementally as they flow through (the cache wraps `read_into` to write into both the caller's buffer and a cache-side buffer, then commits on stream completion). The detailed specification — including the dropped-stream correctness handling called out in the [open question below](#open-questions) — is deferred to [stores-caching.md](./stores-caching.md). Until that section lands, treat `Caching[GetStreaming]` as documented-but-not-yet-specified. The earlier "Caching × GetInto refused at construction" decision is superseded: streaming stores are not refused.
 - **`RangeCoalescing[GetRangeStreaming]`**: works, with the wrapper opening one underlying stream against the coalesced byte range and demultiplexing per-range slices to caller-provided buffers as they arrive. The wrapper's `get_ranges_streaming` returns a `Sequence[ReadStream]`; each per-range stream draws from the shared underlying stream's buffer in offset order. This is genuinely more efficient than the one-shot version for sharded reads from cloud storage — the caller can start decoding the first range's chunks before the last range's bytes have arrived. Algorithm sketch in [stores-range-coalescing.md](./stores-range-coalescing.md), pending an updated subsection.
 - **`Transactional[GetStreaming]`**: orthogonal. `GetStreaming` is read-side; transactions are write-side. Reads inside a transaction stream the same way they do outside. Generations recorded on stream open, not on each `read_into` call.
 - **`ReadOnly[GetStreaming]`**: passes through. `GetStreaming` is a read capability; `ReadOnly` does not strip read capabilities.
@@ -404,7 +557,8 @@ Three new specs land in [stores-conformance.md](./stores-conformance.md):
 ### Worked examples
 
 ```python
-# 1) GPU-direct read into a cupy array (assumes a GDS-aware obstore variant).
+# 1) Device-agnostic read into a CuPy buffer (GPU as one example of a
+# caller-allocated destination; assumes a GDS-aware obstore variant).
 import cupy as cp
 from zarr.storage.stores.obstore import GDSObstoreStore
 
@@ -474,7 +628,7 @@ This subsection's commitments are additive:
 - `LocalStore` and `MemoryStore` can implement `GetStreaming` for free (open file handle, slice over internal bytes); shipping these as the reference implementations validates the protocol shape.
 - `ObstoreStore` and async-fsspec backends are the ones that benefit most; their existing streaming APIs map directly onto `read_into`.
 
-The README's open question on "GPU re-coupling, if it becomes necessary" is resolved by this subsection: `GetStreaming` *is* the GPU re-coupling, and it is shaped so that the caller (not the store) chooses the device. The README entry can be replaced with a pointer to this section.
+The earlier open question on "GPU re-coupling, if it becomes necessary" is resolved by this subsection. `GetStreaming` *is* the device-agnostic IO surface, shaped so that the caller (not the store) chooses the destination — GPU is one application; pre-allocated CPU buffers are the more common one. See [gpu.md](./gpu.md) for the broader framing.
 
 The earlier draft's `GetInto` / `GetRangeInto` / `GetRangesInto` protocol family is *replaced* by `GetStreaming` plus the `read_full` convenience. The one-shot semantics are preserved (a `with stream: stream.read_full(buf)` is a `get_into`); only the protocol's name and shape change.
 
@@ -484,7 +638,7 @@ The earlier draft's `GetInto` / `GetRangeInto` / `GetRangesInto` protocol family
 - **Stream lifetime under async cancellation.** An `async with stream:` block that is cancelled mid-drain should release the underlying connection cleanly. Most async backends handle this via `__aexit__`, but partial reads on cancellation are a contract worth pinning: the buffer's prefix is whatever was drained before cancellation, and the stream is closed. Document explicitly.
 - **`total_size=None` semantics.** Backends that don't know the total size up front (HTTP without Content-Length, chunked transfer) leave `total_size` as None. Callers who want to call `read_full` with a sized buffer have to either know the size from elsewhere (manifest, prior `head()`) or use `read_into` in a loop. This is unavoidable; the protocol cannot synthesize a size the backend doesn't know.
 - **Generation stability mid-stream.** The contract says `generation` is stable for the lifetime of the stream. Backends that detect mid-stream changes (HTTP `If-Match` failure, S3 ETag drift) should raise rather than deliver inconsistent bytes. Backends that cannot detect (fsspec over a backend without versioning) document the limitation. Worth a per-backend audit.
-- **`Caching[GetStreaming]` cache-fill correctness.** The streaming-cache pattern captures bytes into a cache entry as they flow through. If the caller drops the stream mid-drain, the cache entry is incomplete and must not be served on subsequent reads. The cache wrapper marks entries as "in progress" until the stream closes successfully; partial entries are discarded. Detailed in the [caching proposal](./stores-caching.md), pending update.
+- **`Caching[GetStreaming]` cache-fill correctness.** The streaming-cache pattern captures bytes into a cache entry as they flow through. If the caller drops the stream mid-drain, the cache entry is incomplete and must not be served on subsequent reads. Provisional design: the cache wrapper marks entries as "in progress" until the stream closes successfully; partial entries are discarded. Owed in [stores-caching.md](./stores-caching.md); not yet written there.
 - **Pipelined decode integration.** The streaming surface is necessary but not sufficient for pipelined decode; the codec pipeline also has to be streaming-capable. That work belongs in the [Codecs section of the README](../README.md#codecs). The store-layer protocol is shipped first; codec adoption follows.
 - **Backwards-compatible shim.** During the migration window, the existing `Buffer`-returning `Get.get` methods can be implemented in terms of `GetStreaming` (open stream, read_full into a bytearray, wrap as Buffer). This means a backend can ship `GetStreaming` first and get the legacy surface for free. Worth flagging as the recommended migration order.
 - **Cursor-style alternative for local backends.** A `GetIntoStreaming` protocol with explicit `(buffer, source_offset, dest_offset)` cursors would suit local-only backends (LocalStore, MemoryStore) better than the stateful `ReadStream`, because there's no connection to hold open. Stays open as a future addition if a real performance gap emerges; the stream-with-trivial-state pattern is fine for v1.
@@ -706,14 +860,30 @@ class KvStack[S]:
                 return layer
         raise KeyError(f"no layer covers key {key!r}")
 
-    def get(self: "KvStack[Get]", key: str) -> memoryview:
-        return self._route(key).get(key)
+    def get(
+        self: "KvStack[Get]",
+        key: str,
+        *,
+        if_not_match: Generation | None = None,
+    ) -> ReadResult:
+        return self._route(key).get(key, if_not_match=if_not_match)
 
-    def put(self: "KvStack[Put]", key: str, value: bytes | memoryview) -> None:
-        self._route(key).put(key, value)
+    def put(
+        self: "KvStack[Put]",
+        key: str,
+        value: bytes | memoryview,
+        *,
+        if_match: Generation | None = None,
+    ) -> PutResult:
+        return self._route(key).put(key, value, if_match=if_match)
 
-    def delete(self: "KvStack[Delete]", key: str) -> None:
-        self._route(key).delete(key)
+    def delete(
+        self: "KvStack[Delete]",
+        key: str,
+        *,
+        if_match: Generation | None = None,
+    ) -> None:
+        self._route(key).delete(key, if_match=if_match)
 
     def list(
         self: "KvStack[List]",
@@ -776,6 +946,23 @@ shard_layers = [
     for i in range(num_shards)
 ]
 chunks_store = KvStack(shard_layers)
+
+# 5) Composite hierarchy from multiple stores — the session-time
+# replacement for "hierarchy links" (see missing-apis.md § 1). One
+# logical hierarchy assembled from two backing stores, with a
+# subdirectory served from somewhere else.
+#
+# Equivalent to "creating an external link at /experiments/2026 that
+# points at the other store", but without persisting any link object.
+# The composition lives in the user's open-time code; nothing is
+# written to either store.
+store = KvStack([
+    (KeyRange.from_prefix("experiments/2026/"),
+     Prefixed(ObstoreStore(s3_2026_bucket), "")),
+    (KeyRange.complement_of_prefix("experiments/2026/"), main_store),
+])
+# zarr.open(store) sees a single tree; reads under experiments/2026/
+# go to S3, everything else stays local.
 ```
 
 ### Conformance
@@ -851,8 +1038,13 @@ class Prefixed[S]:
     # self-typed signature plus a single-line delegation. The type
     # checker enforces the per-S restriction.
 
-    def get(self: "Prefixed[Get]", key: str) -> memoryview:
-        return self._inner.get(_join(self._prefix, key))
+    def get(
+        self: "Prefixed[Get]",
+        key: str,
+        *,
+        if_not_match: Generation | None = None,
+    ) -> ReadResult:
+        return self._inner.get(_join(self._prefix, key), if_not_match=if_not_match)
 
     def get_range(
         self: "Prefixed[GetRange]",
@@ -861,9 +1053,11 @@ class Prefixed[S]:
         start: int,
         end: int | None = None,
         length: int | None = None,
-    ) -> memoryview:
+        if_not_match: Generation | None = None,
+    ) -> ReadResult:
         return self._inner.get_range(
-            _join(self._prefix, key), start=start, end=end, length=length
+            _join(self._prefix, key), start=start, end=end, length=length,
+            if_not_match=if_not_match,
         )
 
     def get_ranges(
@@ -873,16 +1067,29 @@ class Prefixed[S]:
         starts: Sequence[int],
         ends: Sequence[int] | None = None,
         lengths: Sequence[int] | None = None,
-    ) -> Sequence[memoryview]:
+        if_not_match: Generation | None = None,
+    ) -> Sequence[ReadResult]:
         return self._inner.get_ranges(
-            _join(self._prefix, key), starts=starts, ends=ends, lengths=lengths
+            _join(self._prefix, key), starts=starts, ends=ends, lengths=lengths,
+            if_not_match=if_not_match,
         )
 
-    def put(self: "Prefixed[Put]", key: str, value: bytes | memoryview) -> None:
-        self._inner.put(_join(self._prefix, key), value)
+    def put(
+        self: "Prefixed[Put]",
+        key: str,
+        value: bytes | memoryview,
+        *,
+        if_match: Generation | None = None,
+    ) -> PutResult:
+        return self._inner.put(_join(self._prefix, key), value, if_match=if_match)
 
-    def delete(self: "Prefixed[Delete]", key: str) -> None:
-        self._inner.delete(_join(self._prefix, key))
+    def delete(
+        self: "Prefixed[Delete]",
+        key: str,
+        *,
+        if_match: Generation | None = None,
+    ) -> None:
+        self._inner.delete(_join(self._prefix, key), if_match=if_match)
 
     def list(
         self: "Prefixed[List]",
@@ -902,13 +1109,21 @@ class Prefixed[S]:
     def copy(self: "Prefixed[Copy]", src: str, dst: str) -> None:
         self._inner.copy(_join(self._prefix, src), _join(self._prefix, dst))
 
-    def transaction(self: "Prefixed[Transactional]") -> "TransactionContext":
-        return self._inner.transaction()
+    def with_transaction(
+        self: "Prefixed[Transactional]", txn: "Transaction"
+    ) -> "Prefixed[Transactional]":
+        return Prefixed(self._inner.with_transaction(txn), self._prefix)
 
     # Async variants follow exactly the same shape with `async def` and
-    # `self: Prefixed[GetAsync]`-style annotations.
-    async def get_async(self: "Prefixed[GetAsync]", key: str) -> memoryview:
-        return await self._inner.get_async(_join(self._prefix, key))
+    # `self: Prefixed[GetAsync]`-style annotations, returning ReadResult /
+    # PutResult per the protocol surface above.
+    async def get_async(
+        self: "Prefixed[GetAsync]",
+        key: str,
+        *,
+        if_not_match: Generation | None = None,
+    ) -> ReadResult:
+        return await self._inner.get_async(_join(self._prefix, key), if_not_match=if_not_match)
 
     # ... and so on for get_range_async, get_ranges_async, put_async,
     # delete_async, list_async, list_with_delimiter_async, head_async,
@@ -948,19 +1163,31 @@ def make_store(
 class LocalStore:
     """Filesystem-backed store. Synchronous; implements Get, GetRange,
     GetRanges, Put, Delete, List, ListWithDelimiter, Head, Copy,
-    Transactional (via rename-into-place)."""
+    Transactional (via rename-into-place), Serializable."""
 
     def __init__(self, root: Path | str, *, mkdir: bool = False) -> None: ...
-    def get(self, key: str) -> memoryview: ...
-    def get_range(self, key: str, *, start: int, end: int | None = None, length: int | None = None) -> memoryview: ...
-    def get_ranges(self, key: str, *, starts: Sequence[int], ends: Sequence[int] | None = None, lengths: Sequence[int] | None = None) -> Sequence[memoryview]: ...
-    def put(self, key: str, value: bytes | memoryview) -> None: ...
-    def delete(self, key: str) -> None: ...
+    def get(self, key: str, *, if_not_match: Generation | None = None) -> ReadResult: ...
+    def get_range(self, key: str, *, start: int, end: int | None = None, length: int | None = None, if_not_match: Generation | None = None) -> ReadResult: ...
+    def get_ranges(self, key: str, *, starts: Sequence[int], ends: Sequence[int] | None = None, lengths: Sequence[int] | None = None, if_not_match: Generation | None = None) -> Sequence[ReadResult]: ...
+    def put(self, key: str, value: bytes | memoryview, *, if_match: Generation | None = None) -> PutResult: ...
+    def delete(self, key: str, *, if_match: Generation | None = None) -> None: ...
     def list(self, prefix: str | None = None, *, offset: str | None = None) -> Iterator[str]: ...
     def list_with_delimiter(self, prefix: str | None = None) -> ListResult: ...
     def head(self, key: str) -> ObjectMetadata: ...
     def copy(self, src: str, dst: str) -> None: ...
-    def transaction(self) -> TransactionContext: ...
+    def with_transaction(self, txn: Transaction) -> "LocalStore": ...
+
+    # Discovery sugar (per [performance.md § Default caching policy](./performance.md#default-caching-policy)).
+    # Returns `Caching[LocalStore]` configured per the toggles. Available
+    # on every backend.
+    def with_caching(
+        self,
+        *,
+        metadata: bool = True,
+        chunks: bool | str = False,
+        negative: bool = False,
+        **kwargs,
+    ) -> "Caching[LocalStore]": ...
 ```
 
 `LocalStore` is fully constructed by `__init__`. The existence check that today lives in `_open()` moves to `__init__`: passing a missing root raises `FileNotFoundError` immediately unless `mkdir=True` is set, in which case the directory is created. There is no `_is_open` flag, no `await store.open(...)`, and no lazy-open machinery.
@@ -998,11 +1225,14 @@ class ZipStore:
     async def __aexit__(self, *exc: object) -> None: ...
 
     # Sync capability methods. Behavior outside a context manager
-    # depends on the resolution of the open question below.
-    def get(self, key: str) -> memoryview: ...
-    def get_range(self, key: str, *, start: int, end: int | None = None, length: int | None = None) -> memoryview: ...
+    # depends on the resolution of the open question below. All methods
+    # use the same ReadResult / PutResult / Generation conventions as
+    # LocalStore above.
+    def get(self, key: str, *, if_not_match: Generation | None = None) -> ReadResult: ...
+    def get_range(self, key: str, *, start: int, end: int | None = None, length: int | None = None, if_not_match: Generation | None = None) -> ReadResult: ...
     # ... rest of the read capability set, plus Put / Delete when mode
     # permits writes.
+    def with_caching(self, *, metadata: bool = True, chunks: bool | str = False, negative: bool = False, **kwargs) -> "Caching[ZipStore]": ...
 
     # Pickling: __getstate__ / __setstate__ exist already on today's
     # ZipStore and stay; the file handle and lock are recreated on
@@ -1023,7 +1253,9 @@ class MemoryStore:
     capabilities. Cheap to construct and clone."""
 
     def __init__(self, *, name: str | None = None) -> None: ...
-    # full sync capability set
+    # Full sync capability set. Signatures match LocalStore's (ReadResult
+    # / PutResult / Generation), plus `with_transaction(txn)` and
+    # `with_caching(...)`.
 ```
 
 ### `ObstoreStore`
@@ -1041,11 +1273,18 @@ class ObstoreStore:
     at construction."""
 
     def __init__(self, store: "obstore.store.ObjectStore") -> None: ...
-    async def get_async(self, key: str) -> memoryview: ...
-    async def get_range_async(self, key: str, *, start: int, end: int | None = None, length: int | None = None) -> memoryview: ...
-    async def get_ranges_async(self, key: str, *, starts: Sequence[int], ends: Sequence[int] | None = None, lengths: Sequence[int] | None = None) -> Sequence[memoryview]: ...
-    # async capability set
+    async def get_async(self, key: str, *, if_not_match: Generation | None = None) -> ReadResult: ...
+    async def get_range_async(self, key: str, *, start: int, end: int | None = None, length: int | None = None, if_not_match: Generation | None = None) -> ReadResult: ...
+    async def get_ranges_async(self, key: str, *, starts: Sequence[int], ends: Sequence[int] | None = None, lengths: Sequence[int] | None = None, if_not_match: Generation | None = None) -> Sequence[ReadResult]: ...
+    async def put_async(self, key: str, value: bytes | memoryview, *, if_match: Generation | None = None) -> PutResult: ...
+    async def delete_async(self, key: str, *, if_match: Generation | None = None) -> None: ...
+    # ... rest of the async capability set, plus with_transaction_async
+    # and the same with_caching(...) sugar (synchronous, returns a
+    # Caching wrapper around an AsyncToSync-adapted self).
+    def with_caching(self, *, metadata: bool = True, chunks: bool | str = False, negative: bool = False, **kwargs) -> "Caching[Get & GetRange & GetRanges & Put & Delete]": ...
 ```
+
+Note: `ObstoreStore` is async-only. Worked examples below that compose it with sync wrappers (`Retry`, `RangeCoalescing`, `Caching`) require an explicit `AsyncToSync(ObstoreStore(...))` step; `with_caching` on `ObstoreStore` performs this adaptation internally.
 
 ### `FsspecStore`
 
@@ -1076,8 +1315,10 @@ class FsspecStore:
     @classmethod
     def from_upath(cls, upath: "UPath", **kwargs) -> "FsspecStore": ...
 
-    async def get_async(self, key: str) -> memoryview: ...
-    # async capability set, all join sites use dereference_path
+    async def get_async(self, key: str, *, if_not_match: Generation | None = None) -> ReadResult: ...
+    # Full async capability set; all join sites use dereference_path.
+    # Signatures otherwise match `ObstoreStore`'s.
+    def with_caching(self, *, metadata: bool = True, chunks: bool | str = False, negative: bool = False, **kwargs) -> "Caching[Get & GetRange & GetRanges & Put & Delete]": ...
 ```
 
 ## Wrappers
@@ -1100,20 +1341,34 @@ class Caching[S]:
     """Adds an in-memory LRU over S's read capabilities. Eviction by
     bytes or entries; optional TTL. Writes invalidate the cache.
 
+    Per the default caching policy in [performance.md](./performance.md#default-caching-policy),
+    `Caching[S]` distinguishes three tiers:
+    - metadata cache (on by default in `with_caching`)
+    - chunk cache (opt-in)
+    - negative-result cache (opt-in)
+    plus unconditional in-flight request deduplication (lives in the
+    shared substrate; not a tier the user toggles).
+
     Caching strategy (cache exactly what was requested vs object-level
-    promotion), defaults (256 MiB / 4096 entries, TTL off, negative
-    caching off), eviction policy, write invalidation, recommended
+    promotion), eviction policy, write invalidation, recommended
     composition with `RangeCoalescing` and `Retry`, and the migration
     plan for `experimental.cache_store` are specified in
-    [stores-caching.md](./stores-caching.md)."""
+    [stores-caching.md](./stores-caching.md). Composition with
+    `Transactional` is refused at construction time (see
+    [stores-caching.md](./stores-caching.md) and
+    [stores-transactional.md](./stores-transactional.md))."""
     def __init__(
         self,
         inner: S,
         *,
-        max_bytes: int = 256 << 20,            # 256 MiB
+        metadata: bool = True,
+        chunks: bool | str = False,            # str accepts "256 MB" etc.
+        negative: bool = False,
+        # advanced knobs (most users go through `store.with_caching(...)`)
+        metadata_max_bytes: int = 10 << 20,    # 10 MiB
+        chunk_max_bytes: int = 256 << 20,      # 256 MiB
         max_entries: int = 4096,
         ttl: float | None = None,
-        cache_negative: bool = False,
         cache_negative_ttl: float = 1.0,
     ) -> None: ...
 
@@ -1169,19 +1424,44 @@ class SyncToAsync[S]:
 
 ```python
 # zarr/storage/transactions.py
+#
+# Adopts TensorStore's external-transaction model. A free-standing
+# Transaction object is created, bound to one or more stores via
+# `store.with_transaction(txn)`, and committed once at the top of the
+# call stack. Per-key conditional writes (`if_match=...`) and per-key
+# atomicity (a property of `Put`) are independent of this protocol;
+# `Transaction` is what gives you *multi-key* atomicity.
 
-class TransactionContext(Protocol):
-    """Returned by `Transactional.transaction()`. Use as a context
-    manager; commit on `__exit__` if no exception, abort on exception.
-    Restores V2's atomic rename-into-place semantics for backends that
-    support it; backends that do not (S3, in-memory) get a best-effort
-    write-batching emulation that is documented as non-atomic."""
+class Transaction:
+    """A free-standing transaction context. Created outside any store,
+    bound to stores via `store.with_transaction(txn)`. Two boolean knobs
+    span the isolation/atomicity space. Full semantics, per-backend
+    support matrix, and conflict-handling are in
+    [stores-transactional.md](./stores-transactional.md)."""
+
+    def __init__(
+        self,
+        *,
+        atomic: bool = False,
+        repeatable_read: bool = False,
+    ) -> None: ...
 
     def commit(self) -> None: ...
     def abort(self) -> None: ...
-    def __enter__(self) -> "TransactionContext": ...
+    def __enter__(self) -> "Transaction": ...
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool: ...
+
+    async def commit_async(self) -> None: ...
+    async def __aenter__(self) -> "Transaction": ...
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool: ...
 ```
+
+The earlier draft used a per-store `transaction()` context-manager
+returning a `TransactionContext`. That shape has been retired in favor
+of the TensorStore-derived design above (see
+[stores-transactional.md](./stores-transactional.md) for rationale). The
+old name `TransactionContext` is gone; `TransactionalOCC` is gone (its
+behavior is `Transaction(atomic=True, repeatable_read=True)`).
 
 ## Usage examples
 
@@ -1198,7 +1478,7 @@ store = ObstoreStore(S3Store(bucket="my-bucket", region="us-east-1"))
 from zarr.storage.stores.local import LocalStore
 from zarr.storage.wrappers import Caching, RangeCoalescing
 
-store = Caching(RangeCoalescing(LocalStore("/data/array.zarr")), max_bytes=1 << 30)
+store = Caching(RangeCoalescing(LocalStore("/data/array.zarr")), chunks=True, chunk_max_bytes=1 << 30)
 # Capability set is preserved. Caching outermost, RangeCoalescing inside,
 # matching the recommended ordering in stores-caching.md so that cached
 # results are coalesced fetches.
@@ -1253,10 +1533,10 @@ The migration story for `FsspecStore` specifically is the smallest delta in the 
 
 - **Async naming.** Resolved in favor of two protocol families with the obspec-aligned `Async` suffix on classes and `_async` suffix on methods (sync `Get` / `GetRange` / `GetRanges` / ... and async `GetAsync` / `GetRangeAsync` / `GetRangesAsync` / ...). See the [README subsection on sync-by-default](../README.md#sync-by-default-with-async-as-an-opt-in-protocol-family) for the rationale, the per-backend mapping, and the deprecation path for `zarr.core.sync.sync()`.
 - **Capability intersection types.** Python's `Protocol` does not yet support `&` (intersection) cleanly across all type checkers. The usage examples assume PEP-695-style type expressions. May need to fall back to explicit `Protocol`-merging classes (`class ReadCapable(Get, GetRange, List, Head, Protocol): ...`).
-- **`Transactional` granularity.** Resolved as a two-protocol design: `Transactional` for plain multi-key atomic transactions, `TransactionalOCC` extending it with snapshot-isolation semantics for backends like Icechunk. See [stores-transactional.md](./stores-transactional.md) for the full design, per-backend support matrix, and migration plan (including the V2 rename-into-place restoration for `LocalStore`).
+- **`Transactional` granularity.** Resolved as a single protocol with TensorStore's external-transaction shape: `store.with_transaction(txn)` binds a free-standing `Transaction(atomic=..., repeatable_read=...)` object to the store. Snapshot-isolation (formerly proposed as a separate `TransactionalOCC` protocol) is `atomic=True, repeatable_read=True` on the same `Transaction`. See [stores-transactional.md](./stores-transactional.md) for the full design, per-backend support matrix, and migration plan (including the V2 rename-into-place restoration for `LocalStore`).
 - **Backwards compatibility window.** How long does the `Store` ABC remain importable? One major release? Two? Affects how aggressively wrappers can replace inheritance-based extension.
 - **Return type.** Resolved in favor of `memoryview` over `bytes` and obspec's `Buffer`. See the [README subsection on returning `memoryview`](../README.md#returning-memoryview-from-store-read-methods) for the three-way comparison and the per-backend migration. The door stays open to upgrade to obspec's `Buffer` later if explicit lifetime semantics become necessary; the migration would be additive.
-- **GPU re-coupling, if it becomes necessary.** Option 1 ([README](../README.md#decoupling-prototype-from-the-read-api)) gives up zero-copy DMA into device buffers in principle. If the obstore GPU integration matures and we want that path back, the smallest delta is option 3: introduce a `ReadContext` parameter that carries a `BufferPrototype`, and let stores that opt in return `Buffer` instead of `bytes`. Backends without the opt-in continue to return `bytes` and get wrapped above. This is a strictly additive change relative to option 1, so committing to option 1 now does not foreclose option 3 later.
+- **Device-agnostic IO re-coupling, if it becomes necessary.** Option 1 ([stores.md](./stores.md#decoupling-prototype-from-the-read-api)) gives up zero-copy DMA into caller-allocated (e.g. GPU) buffers via the *allocating* `Get`/`GetRange` path. The full device-agnostic story is delivered by `GetStreaming` instead — see [§ Streaming and caller-allocated reads via `GetStreaming`](#streaming-and-caller-allocated-reads-via-getstreaming) above and [gpu.md](./gpu.md) for the broader framing. If we later want the allocating path to also accept caller-specified destinations, the smallest delta is option 3 from stores.md: introduce a `ReadContext` parameter that carries a `BufferPrototype`. This is strictly additive relative to option 1.
 - **`ZipStore` lifecycle contract.** Whether methods called outside a context manager should raise, warn, or be supported indefinitely. Five options are in play:
   1. **Indefinite lazy-open.** Status quo behavior preserved; context manager is documented as recommended but not required. `__del__` and pickle round-trip handle cleanup. No deprecation, no break. Lowest risk; resource-holding stores stay an explicit exception in the design (which the README already carves out).
   2. **Deprecation cycle.** `DeprecationWarning` for one or two releases, then `RuntimeError`. Final state is uniform with the rest of the design. Cost: real ergonomic tax on distributed scheduling (dask, ray) where task functions today receive an opened store and would need to enter a context manager per task.

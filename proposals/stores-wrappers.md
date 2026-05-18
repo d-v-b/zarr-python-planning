@@ -21,8 +21,13 @@ class ReadOnly[S]:
     def __init__(self, inner: S) -> None:
         self._inner = inner
 
-    def get(self: "ReadOnly[Get]", key: str) -> memoryview:
-        return self._inner.get(key)
+    def get(
+        self: "ReadOnly[Get]",
+        key: str,
+        *,
+        if_not_match: "Generation | None" = None,
+    ) -> "ReadResult":
+        return self._inner.get(key, if_not_match=if_not_match)
 
     def get_range(
         self: "ReadOnly[GetRange]",
@@ -31,11 +36,14 @@ class ReadOnly[S]:
         start: int,
         end: int | None = None,
         length: int | None = None,
-    ) -> memoryview:
-        return self._inner.get_range(key, start=start, end=end, length=length)
+        if_not_match: "Generation | None" = None,
+    ) -> "ReadResult":
+        return self._inner.get_range(
+            key, start=start, end=end, length=length, if_not_match=if_not_match
+        )
 
     # ... and so on for every read capability. Notably, `put`, `delete`,
-    # `copy`, and `transaction` are NOT defined on `ReadOnly[S]` regardless
+    # `copy`, and `with_transaction` are NOT defined on `ReadOnly[S]` regardless
     # of what S advertises. This is the entire point: the wrapper strips
     # the write surface.
 ```
@@ -68,15 +76,21 @@ class Retry[S]:
         jitter: float = 0.1,                    # 0..1, fraction of backoff
     ) -> None: ...
 
-    def get(self: "Retry[Get]", key: str) -> memoryview: ...
+    def get(
+        self: "Retry[Get]",
+        key: str,
+        *,
+        if_not_match: "Generation | None" = None,
+    ) -> "ReadResult": ...
     # ... and so on for every capability of S, each wrapped in the same
-    # retry loop.
+    # retry loop. Return types follow the ReadResult / PutResult
+    # conventions in stores-api.md.
 ```
 
 ### Retry semantics
 
 - **What gets retried.** Calls that raise an exception in `retry_on`. Other exceptions propagate immediately.
-- **What does not get retried.** `Transactional.transaction()` itself does not retry (committing a transaction has its own concurrency-control story; see the [transactional proposal](./stores-transactional.md#composition-with-other-wrappers)). `OCCTransactionContext.commit()` raising `ConflictError` propagates without retry; the retry loop is caller-side.
+- **What does not get retried.** Transaction commits do not retry (committing a transaction has its own concurrency-control story; see the [transactional proposal](./stores-transactional.md#composition-with-other-wrappers)). `Transaction.commit()` raising `TransactionFailed` propagates without retry; the retry loop is caller-side.
 - **Backoff schedule.** Attempt N (1-indexed) waits `min(initial_backoff * backoff_multiplier^(N-1), max_backoff)` seconds before retrying, with `± jitter * delay` added uniformly. Default: 100 ms, 200 ms, 400 ms with up to 10% jitter, capped at 10 s.
 - **Per-call budget.** `max_attempts` is per call, not per store. A burst of failing calls each gets its own retry budget.
 - **Idempotency.** All read operations are idempotent. Writes are idempotent in the put-by-key model that every supported backend implements (no append, no atomic-counter increment). So retrying a `put` after a transient failure is safe; the worst case is two writes of the same value.
@@ -105,12 +119,17 @@ class Tracing[S]:
         self._inner = inner
         self._tracer = tracer
 
-    def get(self: "Tracing[Get]", key: str) -> memoryview:
+    def get(
+        self: "Tracing[Get]",
+        key: str,
+        *,
+        if_not_match: "Generation | None" = None,
+    ) -> "ReadResult":
         with self._tracer.start_as_current_span("zarr.store.get") as span:
             span.set_attribute("zarr.store.key", key)
             try:
-                result = self._inner.get(key)
-                span.set_attribute("zarr.store.bytes", len(result))
+                result = self._inner.get(key, if_not_match=if_not_match)
+                span.set_attribute("zarr.store.bytes", len(result.value))
                 return result
             except Exception as e:
                 span.record_exception(e)
@@ -145,8 +164,13 @@ class SyncToAsync[S]:
         executor: "Executor | None" = None,
     ) -> None: ...
 
-    async def get_async(self: "SyncToAsync[Get]", key: str) -> memoryview:
-        return await asyncio.to_thread(self._inner.get, key)
+    async def get_async(
+        self: "SyncToAsync[Get]",
+        key: str,
+        *,
+        if_not_match: "Generation | None" = None,
+    ) -> "ReadResult":
+        return await asyncio.to_thread(self._inner.get, key, if_not_match=if_not_match)
 
     async def get_range_async(
         self: "SyncToAsync[GetRange]",
@@ -155,11 +179,13 @@ class SyncToAsync[S]:
         start: int,
         end: int | None = None,
         length: int | None = None,
-    ) -> memoryview:
+        if_not_match: "Generation | None" = None,
+    ) -> "ReadResult":
         return await asyncio.to_thread(
-            self._inner.get_range, key, start=start, end=end, length=length
+            self._inner.get_range, key, start=start, end=end, length=length, if_not_match=if_not_match
         )
-    # ... async variants for every sync capability of S.
+    # ... async variants for every sync capability of S. Return types follow
+    # the ReadResult / PutResult conventions defined in stores-api.md.
 ```
 
 ### Sync-to-async semantics
@@ -184,9 +210,17 @@ class AsyncToSync[S]:
         loop: "asyncio.AbstractEventLoop | None" = None,
     ) -> None: ...
 
-    def get(self: "AsyncToSync[GetAsync]", key: str) -> memoryview:
-        return _run_sync(self._inner.get_async(key), loop=self._loop)
-    # ... sync variants for every async capability of S.
+    def get(
+        self: "AsyncToSync[GetAsync]",
+        key: str,
+        *,
+        if_not_match: "Generation | None" = None,
+    ) -> "ReadResult":
+        return _run_sync(
+            self._inner.get_async(key, if_not_match=if_not_match), loop=self._loop
+        )
+    # ... sync variants for every async capability of S. Same ReadResult /
+    # PutResult conventions as the protocols in stores-api.md.
 ```
 
 ### Async-to-sync semantics
@@ -203,8 +237,8 @@ class AsyncToSync[S]:
 | `ReadOnly` | idempotent | OK | OK | OK | OK | OK | OK | OK | strips writes |
 | `Retry` | OK | flatten | OK | OK | OK | OK | OK | OK | see [transactional](./stores-transactional.md#composition-with-other-wrappers) |
 | `Tracing` | OK | OK | flatten | OK | OK | OK | OK | OK | OK |
-| `SyncToAsync` | OK | OK | OK | absurd | OK (round trip) | OK | OK | OK | depends |
-| `AsyncToSync` | OK | OK | OK | OK (round trip) | absurd | OK | OK | OK | depends |
+| `SyncToAsync` | OK | OK | OK | absurd | OK (round trip) | OK | OK | OK | OK if the inner `Transactional` is sync; `Transaction.commit_async()` is then itself thread-bridged |
+| `AsyncToSync` | OK | OK | OK | OK (round trip) | absurd | OK | OK | OK | OK if the inner `Transactional` is async; `Transaction.commit()` runs the loop |
 | `Caching` | OK | OK | OK | OK | OK | flatten | order matters | OK | refused |
 | `RangeCoalescing` | OK | OK | OK | OK | OK | order matters | flatten | OK | OK |
 | `Prefixed` | OK | OK | OK | OK | OK | OK | OK | flatten | OK |
@@ -217,7 +251,9 @@ store = Tracing(
     Caching(
         RangeCoalescing(
             Retry(
-                ObstoreStore(S3Store(bucket="...", region="..."))
+                AsyncToSync(  # ObstoreStore is async-only; sync wrappers above need a sync surface
+                    ObstoreStore(S3Store(bucket="...", region="..."))
+                )
             )
         )
     ),
@@ -228,7 +264,8 @@ store = Tracing(
 - **`Tracing` outermost** so cache hits are still traced.
 - **`Caching` next** so cached results short-circuit the rest of the stack.
 - **`RangeCoalescing` next** so coalesced fetches are what's cached.
-- **`Retry` innermost** so a transient failure on a coalesced fetch is retried as one operation.
+- **`Retry` next** so a transient failure on a coalesced fetch is retried as one operation.
+- **`AsyncToSync` innermost above the backend** because `ObstoreStore` is async-only and the wrappers above expect a sync capability surface. For an async-throughout stack, drop `AsyncToSync` and use the `Async`-suffixed variants of each wrapper.
 
 Composing in different orders produces well-defined but suboptimal behavior. The conformance suite's `CapabilityPreservationSpec` ensures the compositions all preserve capability surfaces; per-wrapper specs ensure they preserve semantics.
 

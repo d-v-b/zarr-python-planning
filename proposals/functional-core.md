@@ -77,18 +77,29 @@ Two kinds of objects survive in the new design: **stores** and **codecs**.
 
 ### A thin imperative shell, with engines as namespaces
 
-Higher-level operations — read a chunk, read a selection, write a chunk, write a selection — become module-level functions. They compose pure functions from the core (to figure out what to do) with method calls on stores and codecs (to actually do it). There are no `ChunkPipeline`, `CodecPipeline`, or `SliceExecutor` classes. Those were objects whose only purpose was to hold a single method, which is what a function is.
+Higher-level operations become module-level functions, not classes. Concretely an engine exports exactly four functions:
 
-An **engine** is a module that exports this small set of read/write functions. Zarr-Python ships a default Python engine. Alternative engines are alternative modules. A Zarrs engine is a module whose `read_selection` hands off to Zarrs internally; a TensorStore engine is the equivalent for TensorStore. Mixing across engines — for example, "Python's orchestration with Zarrs' codecs" — is a short module that imports the parts you want from each.
+- `read_chunk(store, metadata, chunk_coords, ...)` — fetch and decode one chunk.
+- `read_selection(store, metadata, plan, ...)` — execute an IO plan covering many chunks for one selection.
+- `write_chunk(store, metadata, chunk_coords, data, ...)` — encode and write one chunk.
+- `write_selection(store, metadata, plan, data, ...)` — execute an IO plan for a multi-chunk write.
+
+The selection functions take an **IO plan** — a pure data structure produced by the core from a metadata document plus a selection. The plan enumerates the chunks to touch, the byte ranges within each, how decoded chunks compose into the output, and any cache-hit short-circuits. Producing the plan is a pure function in the core; executing it is the engine's job. This is the same split as TensorStore's `Spec → ResolvedSpec → IO` pipeline and the natural seam at which alternative engines plug in (see [performance.md § Wrapping `zarrs` and TensorStore as alternative engines](./performance.md#wrapping-zarrs-and-tensorstore-as-alternative-engines)).
+
+There are no `ChunkPipeline`, `CodecPipeline`, or `SliceExecutor` classes. Those were objects whose only purpose was to hold a single method, which is what a function is.
+
+An **engine** is a module that exports those four functions. Zarr-Python ships a default Python engine. Alternative engines are alternative modules. A Zarrs engine is a module whose `read_selection` hands the plan off to Zarrs internally; a TensorStore engine is the equivalent for TensorStore. Mixing across engines — for example, "Python's orchestration with Zarrs' codecs" — is a short module that imports the parts you want from each.
 
 The public `Array` and `Group` classes are thin facades. An `Array` holds a metadata document, a store, an engine, and a codec registry, and delegates each method to the engine. Switching backends means swapping one of those four pieces of state; the public API does not change.
+
+Per [performance.md § Where the caching substrate sits relative to engines](./performance.md#where-the-caching-substrate-sits-relative-to-engines), the caching substrate (in-flight dedup, metadata cache, chunk cache when opted in) sits **above** the engine boundary. Engine calls see deduped, cache-checked requests; engines may keep their own internal caches but do not override the substrate.
 
 ## How the new shape solves the problems
 
 | Problem | How the new shape resolves it |
 |---|---|
 | Integrating Zarrs/TensorStore requires a bespoke external package | An engine is a module of four functions. An integration with another implementation ships those four functions and inherits everything above the I/O — metadata handling, hierarchy traversal, key encoding — unchanged. |
-| Parts of Zarr-Python cannot be used in isolation | The functional core splits cleanly into focused packages (e.g. `zarr-metadata`, `zarr-dtype`, `zarr-codec-spec`). Downstream tools depend on the parts they need. |
+| Parts of Zarr-Python cannot be used in isolation | The functional core splits cleanly into focused packages (e.g. `zarr-metadata`, `zarr-dtype`, `zarr-codec`). Downstream tools depend on the parts they need. |
 | Async/sync leaks into every layer | Async belongs only in the shell. The same engine has sync and async variants in separate modules; the core is identical for both. The recurring event-loop reentrancy bugs go away because the only place an event loop is involved is the shell. |
 | Testing requires the whole stack | The core is pure functions over pure data. Tests run in milliseconds with no fixtures, no event loops, no stores. |
 | Extension is painful | Codecs, chunk grids, key encodings, and data types become small additions to the core (pure data) plus, where needed, a small stateless object (codecs). No deep base classes to subclass, no internal hooks to override. |
@@ -103,7 +114,7 @@ The public `Array` and `Group` classes are thin facades. An `Array` holds a meta
 
 **Cleaner integration with downstream libraries.** Dask, Xarray, and similar projects that today reach into Zarr-Python internals to optimize specific patterns can target the core's pure functions instead of brittle internal APIs.
 
-**A path to the packaging goals already articulated in the README.** The motivation for splitting Zarr-Python into multiple packages is the same motivation as the functional-core refactor: model the real dependency relationships, support partial adoption, harden conceptual boundaries.
+**A path to splitting Zarr-Python into focused packages.** The motivation for splitting Zarr-Python into multiple packages is the same motivation as the functional-core refactor: model the real dependency relationships, support partial adoption, harden conceptual boundaries. The concrete package list and dependency map are spelled out below.
 
 ## What this is not
 
@@ -112,14 +123,57 @@ The public `Array` and `Group` classes are thin facades. An `Array` holds a meta
 - **Not a redesign of the store layer.** The existing stores proposal stands; we add only the serialization capability that lets stores cross language boundaries.
 - **Not a single-release push.** The refactor is incremental and staged. The functional core can be extracted and tested alongside the existing internals; engines can be added one at a time; the public facade can migrate to delegating into the core gradually, with no flag day.
 
+## Concrete packaging plan
+
+The functional core gives us clean seams along which `zarr-python` can be split into independently installable packages. This section names the packages and the dependency relationships they should preserve.
+
+### The packages
+
+- `zarr-metadata` — pure data structures and parsers for Zarr V2 and V3 metadata documents. Also owns the **chunk-addressing** types — `ChunkGrid` (regular and Rectilinear), `ChunkKeyEncoding` (V2 and V3 variants, including future entries from `zarr-extensions`) — because they are pure-data descriptions consumed by both metadata parsing and chunk lookup. This is the package that grows when a new chunk grid or key encoding is specified, which is one of the README's 4.0 acceleration goals.
+- `zarr-dtype` — Zarr data type system.
+- `zarr-codec` — the codec interface (no concrete codec implementations). Defines the `Codec` protocol family, `recommended_concurrency`, `PartialDecodeCapability`, `decode_into`, and so on. Codec implementations live in `zarr-python` or in third-party packages that depend on `zarr-codec`.
+- `zarr-store` — the store interface (capability protocols).
+- `zarr-python` — the user-facing facade that re-exports the pieces above, ships the default Python engine, and ships the concrete built-in codecs (`gzip`, the V2/V3 codec wrappers, and so on).
+
+Today, a downstream tool that only needs to parse metadata still has to install `numpy`, `numcodecs`, `google-crc32c`, `fsspec`, and the rest of [Zarr-Python's runtime dependencies](https://github.com/zarr-developers/zarr-python/blob/520344adc7843f3b56eba51269d265ddeed3c44b/pyproject.toml#L35-L40). A `zarr-metadata` package needs little more than `typing_extensions`. The evidence from `yaozarrs`, `mesh-n-bone`, `xcube-resampling`, and `ngff-zarr` (above) is the cost of *not* doing this split.
+
+### The dependency relationships
+
+The split mirrors the real dependency structure of the Zarr format:
+
+- Parsing metadata documents depends on: a metadata API.
+- Storing metadata documents depends on: a metadata API + a store API.
+- Finding stored chunks depends on: a metadata API + a store API + a chunk grid API + a chunk key encoding API.
+- Decoding chunks depends on: all of the above + a data type API + a codec API.
+
+Modeling these as actual package boundaries hardens the conceptual boundaries inside the project and lets downstream tools depend on exactly the surface they use. This is the approach [`zarrs`](https://github.com/zarrs/zarrs) uses on the Rust side.
+
+### Case study: breaking the codec circular dependency
+
+Today, `zarr-python` defines the codec interface via a `Codec` base class. Any external codec library must subclass it and register with the codec registry — making `zarr-python` a runtime dependency of every external codec library. The pathological case is implementing a *core* codec (say, a Rust-based `gzip`) in an external library: `zarr` depends on `external.gzip`, but `external.gzip` depends on `zarr` for the `Codec` base class. Any change to `Codec` without a perfectly synchronized update to `external.gzip` is a source of subtle bugs.
+
+This is not hypothetical. `zarr-python` used to depend on `numcodecs`, which depended on `zarr-python`. Untangling the cycle took real work — see [`numcodecs#780`](https://github.com/zarr-developers/numcodecs/pull/780) and [`zarr-python#3376`](https://github.com/zarr-developers/zarr-python/pull/3376). Registering codecs via [entry points](https://packaging.python.org/en/latest/specifications/entry-points/) instead of explicit imports *weakens* the coupling but does not remove it.
+
+Extracting `zarr-codec` as an independent package with its own version number, importable by `zarr-python` and any other package, is the only real fix. (As a historical note: Zarr-Python 2.x avoided this cycle by importing the codec interface from `numcodecs`. The cycle is a regression introduced by the 3.x rewrite.)
+
+### Related GitHub content
+
+- [`zarr#3913`](https://github.com/zarr-developers/zarr-python/issues/3913)
+- [`zarr#3867`](https://github.com/zarr-developers/zarr-python/issues/3867)
+- [`zarr#3875`](https://github.com/zarr-developers/zarr-python/pull/3875)
+- [`zarr#2863`](https://github.com/zarr-developers/zarr-python/pull/2863)
+- [`zarr#2391`](https://github.com/zarr-developers/zarr-python/issues/2391) — *Rethinking Zarr's core dependencies*
+- [`zarr#3597`](https://github.com/zarr-developers/zarr-python/issues/3597) — *avoid required, indirect dependencies*
+
 ## Relationship to existing proposals
 
-- [`proposals/stores-api.md`](./stores-api.md) — preserved as-is, with one addition: a `Serializable` capability and a versioned store declaration data format. The conformance suite gains a matching specification.
-- [`proposals/stores-conformance.md`](./stores-conformance.md), [`proposals/stores-caching.md`](./stores-caching.md), [`proposals/stores-range-coalescing.md`](./stores-range-coalescing.md), [`proposals/stores-transactional.md`](./stores-transactional.md), [`proposals/stores-wrappers.md`](./stores-wrappers.md) — preserved unchanged. The functional core sits above the store layer and does not touch its design.
-- README sections on **Codecs**, **Packaging**, **Concurrency**, and **Data types** — the functional core enables the directions argued in each of these sections. The codec API rewrite folds in naturally (codecs become small, stateless, capability-bundled objects); the packaging split becomes implementable because the core has clean package-shaped seams; the concurrency story simplifies because async lives only in the shell; new data type support becomes a pure-data addition.
+- [`proposals/stores-api.md`](./stores-api.md) — preserved as-is, with one addition: a `Serializable` capability that lets a store produce a portable declaration of how to connect to its backend (an S3 URL, a path, an fsspec URL — not the store's contents). The conformance suite gains a matching specification.
+- [`proposals/stores-conformance.md`](./stores-conformance.md), [`proposals/stores-range-coalescing.md`](./stores-range-coalescing.md), [`proposals/stores-transactional.md`](./stores-transactional.md), [`proposals/stores-wrappers.md`](./stores-wrappers.md) — preserved unchanged. The functional core sits above the store layer and does not touch their design.
+- [`proposals/stores-caching.md`](./stores-caching.md) — preserved in shape, with two requirements imposed by [performance.md § Default caching policy](./performance.md#default-caching-policy): the wrapper grows the three-tier toggles (`metadata` / `chunks` / `negative`) and every backend grows a `with_caching(...)` convenience method. The wrapper class itself stays.
+- README sections on **Codecs**, **Concurrency**, and **Data types** — the functional core enables the directions argued in each of these sections. The codec API rewrite folds in naturally (codecs become small, stateless, capability-bundled objects); the concurrency story simplifies because async lives only in the shell; new data type support becomes a pure-data addition.
 
 ## Open questions for follow-on work
 
 - **Engine selection ergonomics at the public surface.** Explicit keyword argument, URL-scheme routing, global configuration, or some combination — to be specified when drafting the facade layer.
-- **Format and version of the store declaration.** Likely a typed dataclass with a JSON schema; alignment with obstore's URL+config pattern worth exploring.
+- **Format of the store declaration.** Likely a typed dataclass with a JSON schema; alignment with obstore's URL+config pattern worth exploring. The declaration carries store identity and connection info — not stored data.
 - **Migration sequencing.** Which core pieces extract first; whether the existing `Array`/`AsyncArray` pair stays or collapses into a single facade with sync and async methods; how long deprecation windows last. To be addressed in the implementation plan.

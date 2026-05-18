@@ -34,7 +34,7 @@ To reach this I think we should push in the following directions:
 - Give Zarr-Python users excellent performance, out of the box. 
 - Make Zarr-Python APIs ergonomic and useful for developers. 
 - Expand our scope to cover vital quality-of-life routines like data copying, rechunking, and the like.
-- Support the growth of Python tools that don't use Zarr-Python explicitly.  
+- Support the growth of Python tools across all levels of the Zarr stack.  
 - Accelerate the implementation of new codecs, chunk grids, chunk key encodings, etc. 
 
 ## What I'm afraid of
@@ -51,19 +51,35 @@ The 4.0 work proposed here is that overdue investment. The user-facing API does 
 
 ## Foundation: a functional core
 
-Several themes below depend on a common substrate: a refactor of Zarr-Python's internals around a *functional core* — pure data structures and pure functions for the algebra of Zarr (metadata, chunk layouts, slice planning, codec walking) — with the side-effecting protocols (stores, codecs) at the edges. This is itself an internal change, not a user-facing one. It is foundational for the Packaging, Codecs, and Stores themes, and it unlocks the high-performance integration story for Zarrs and TensorStore by providing a clean substrate for engine-level pluggability.
+Several themes below depend on a common substrate: a refactor of Zarr-Python's internals around a *functional core* — pure data structures and pure functions for the algebra of Zarr (metadata, chunk layouts, slice planning, codec walking) — with the side-effecting protocols (stores, codecs) at the edges. This is itself an internal change, not something user-facing. It is foundational for the Packaging, Codecs, and Stores themes, and it unlocks the high-performance integration story for Zarrs and TensorStore by providing a clean substrate for engine-level pluggability.
 
 → [proposals/functional-core.md](./proposals/functional-core.md)
 
+## The Zarr Stack
+
+There are levels of Zarr support. Some applications, like validators for domain-specific Zarr conventions, only need to read Zarr metadata documents. They don't need to read and write chunks. Other applications might only need read-only access to array metadata and the stored chunks, and nothing else. Tensorstore only supports reading and writing arrays, but not the `attributes` field of Zarr metadata, and it doesn't support any operations on Zarr groups. Zarr Python supports all types of operations -- reading and writing arrays and groups -- but doesn't support exactly the same set of data types and codecs as other "complete" implementations. 
+
+The story here is that different applications need to do different operations with Zarr data. This is something we *learned* from seeing how different tools and communities leverage Zarr. Let's call a set of tools that supports these various operations a "Zarr stack". 
+
+Concretely, the levels of the stack — from most abstract to most concrete — look something like this:
+
+1. **Conventions** — domain-specific schemas built on top of Zarr (OME-NGFF, GeoZarr, anndata-zarr). Consumers: validators, format-specific readers.
+2. **Groups** — Zarr hierarchies, traversal, group-level attributes.
+3. **Arrays** — array-level metadata, indexing, slicing, the user-facing array object.
+4. **Chunk decoding** — the codec pipeline that turns stored bytes into array values.
+5. **Chunk addressing** — chunk grids and key encodings that map array coordinates to store keys.
+6. **Stores** — the key-value abstraction over filesystems, object stores, and other backends.
+7. **Metadata** — pure data documents describing arrays and groups.
+
+Today, `zarr-python` is a monolith that serves every level. A consumer who only needs level 1 has to install the full dependency footprint of level 7. A faster implementation at level 4 (Zarrs, TensorStore) cannot easily plug in without re-implementing levels 1–3. The dependency-footprint workarounds in the ecosystem (`yaozarrs`, `mesh-n-bone`, `xcube-resampling`, `ngff-zarr`) and the existence of a bespoke `zarrs-python` integration package are evidence that the monolith shape does not match how the ecosystem actually uses Zarr.
+
+The 4.0 direction is to re-shape `zarr-python` around the stack: each level is something you can depend on, conform to, or replace, without buying every level above it. Concretely, this means a focused package per level (`zarr-metadata`, `zarr-store`, `zarr-codec`, ...), a conformance suite that defines what it means to serve each level, and a clean seam at the chunk-decoding level where alternative engines like Zarrs and TensorStore can take over without re-doing the layers above them. This reframes our 4.0 goal of *"support Python tools across all levels of the Zarr stack"* from a slogan into a concrete commitment: every level has a named package, a documented interface, and a conformance suite. It also reframes high-performance backends from competitors to **peers at specific levels** — a user can keep `zarr-python`'s metadata, hierarchy, and indexing while routing chunk reads through Zarrs.
+
+The mechanism for this re-shaping is the [functional-core refactor](./proposals/functional-core.md), which extracts the pure-data and pure-function parts of each level out of the monolith and into independently usable pieces.
+
 ## What we're changing
 
-Each theme below has a corresponding proposal document under `proposals/`. Substantial themes (Packaging, Codecs, Stores) have full proposals; the rest are stubs awaiting expansion.
-
-### Packaging
-
-Split Zarr-Python into separate packages along the real dependency boundaries of the Zarr format — `zarr-metadata`, `zarr-dtype`, `zarr-codec`, and so on. Today a downstream tool that only needs to parse metadata still has to install numpy, numcodecs, and fsspec — and several projects (yaozarrs, mesh-n-bone, xcube-resampling, ngff-zarr) have already routed around `zarr-python` because of that cost. Splitting hardens the conceptual boundaries inside the library and lets downstream tools depend on exactly the surface they use.
-
-→ [proposals/packaging.md](./proposals/packaging.md)
+Each theme below has a corresponding proposal document under `proposals/`. Substantial themes (Functional Core, Codecs, Stores, Lazy Indexing) have full proposals; the rest are stubs awaiting expansion.
 
 ### Codecs
 
@@ -76,6 +92,12 @@ The codec API is wrapped in an unnecessary async layer (a profiling-hotspot), de
 The store abstraction conflates lifecycle, path handling, sync/async, capability advertisement, and read-only semantics into one inheritance hierarchy, and the resulting maintenance friction has produced a recurring stream of regressions. Redesign stores as composable capability protocols (Get, Put, List, ...) with composable wrappers (caching, range coalescing, retries), a sync/async family split, transactional semantics, and a shared conformance suite that backends and wrappers parameterize.
 
 → [proposals/stores.md](./proposals/stores.md) (with tier-3 specs linked from there)
+
+### Lazy indexing
+
+`Array.__getitem__` performs IO eagerly and returns NumPy, which makes Zarr arrays the odd one out among modern array libraries, blocks participation in the Python Array API ecosystem, and forces every performance-sensitive user through Dask to recover basic IO optimizations like deduplication, slice fusion, and range coalescing. Make indexing return a lazy view by default, conform to the Array API standard, and introduce a small query planner that turns chained selections into a single IO plan before any chunks are fetched.
+
+→ [proposals/lazy-indexing.md](./proposals/lazy-indexing.md)
 
 ### Consolidated metadata
 

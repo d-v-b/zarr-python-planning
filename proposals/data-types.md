@@ -2,6 +2,8 @@
 
 > **Status:** stub. For the high-level pitch, see the [parent README](../README.md). The notes below are placeholder content; this proposal awaits expansion.
 
+The dtype work is one of the named focused packages in the [functional-core packaging plan](./functional-core.md#concrete-packaging-plan): `zarr-dtype` ships pure data-type definitions independently of the rest of `zarr-python`.
+
 ## Current planning notes
 
 - bfloat16 and mldtypes ([zarr#2656](https://github.com/zarr-developers/zarr-python/issues/2656))
