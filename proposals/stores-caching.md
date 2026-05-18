@@ -117,6 +117,14 @@ class Caching[S]:
     # `self: Caching[GetAsync]`-style annotations.
 ```
 
+### `CachingAsync[S]`: the async parallel
+
+`CachingAsync[S]` is the async wrapper with the same semantics as `Caching[S]` — same key-agnostic LRU, same per-key in-flight dedup, same eviction parameters, same composition rules. The split exists for the same reason every other wrapper has sync and async variants (per [stores-api.md § Sync-by-default with async as an opt-in protocol family](./stores-api.md)): each operates over a single sync/async family rather than bridging them.
+
+The constructor signature is identical to `Caching[S]`; only the methods are `async def`. Cache state is shared across all callers of one wrapper instance regardless of which sync/async family they came through. Composition with `SyncToAsync` / `AsyncToSync` works the same way as for the other wrappers.
+
+`CachingAsync[S]` is the return type of `backend.with_caching_async(...)` on async-only backends (see below). Spec coverage in [stores-conformance.md § CachingSpec](./stores-conformance.md) applies to both `Caching` and `CachingAsync` (the test bodies parameterize over the variant).
+
 ### The `with_caching(...)` sugar on every backend
 
 Every backend exposes a fluent `with_caching(...)` method that returns a `Caching[Self]`:

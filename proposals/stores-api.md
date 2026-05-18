@@ -1278,7 +1278,7 @@ class ObstoreStore:
     def with_caching_async(self, **kwargs) -> "CachingAsync[ObstoreStore]": ...
 ```
 
-Note: `ObstoreStore` is async-only. Worked examples below that compose it with sync wrappers (`Retry`, `RangeCoalescing`, `Caching`) require an explicit `AsyncToSync(ObstoreStore(...))` step; `with_caching` on `ObstoreStore` performs this adaptation internally.
+Note: `ObstoreStore` is async-only. Worked examples below that compose it with sync wrappers (`Retry`, `RangeCoalescing`, `Caching`) require an explicit `AsyncToSync(ObstoreStore(...))` step; `with_caching` on `ObstoreStore` performs this adaptation internally — **the returned object has a sync capability surface, not the original async surface**. Users building async-throughout pipelines should call `with_caching_async(...)` instead, which returns `CachingAsync[Self]` and preserves the async surface. Calling `.with_caching(...)` on an async backend silently collapses the pipeline to sync; the separate method names exist to make that choice explicit.
 
 ### `FsspecStore`
 
@@ -1349,10 +1349,14 @@ class Caching[S]:
     promotion), eviction policy, write invalidation, recommended
     composition with `RangeCoalescing` and `Retry`, and the migration
     plan for `experimental.cache_store` are specified in
-    [stores-caching.md](./stores-caching.md). Composition with
-    `Transactional` is refused at construction time (see
-    [stores-caching.md](./stores-caching.md) and
-    [stores-transactional.md](./stores-transactional.md))."""
+    [stores-caching.md](./stores-caching.md).
+
+    `Caching(inner)` raises `TypeError` if `inner` advertises
+    `Transactional`. The two cannot compose: a cache wrapped around a
+    transactional store would surface stale (pre-commit) reads to
+    callers outside the transaction. See [stores-transactional.md §
+    Composition with other wrappers](./stores-transactional.md#composition-with-other-wrappers)
+    for the symmetric refusal on the transactional side."""
     def __init__(
         self,
         inner: S,

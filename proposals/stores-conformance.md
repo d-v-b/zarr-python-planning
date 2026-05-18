@@ -224,7 +224,13 @@ The full eight-test sketch and the four-test extension for OCC backends are in [
 - `test_atomic_multi_key`. A multi-`put` transaction either commits all keys or none.
 - `test_per_key_atomicity_no_torn_write`. Single-key writes are observed as either old or new value, never a partial. Skipped on backends that document the limitation (`ZipStore`).
 
-Snapshot-isolation tests are part of `TransactionalSpec` itself, gated on backends that support `Transaction(atomic=True, repeatable_read=True)` (Icechunk and similar). Tests cover `TransactionFailed` conflict semantics, generation round-trip on writes, and that conflict-failed transactions do not leak writes.
+Snapshot-isolation tests are part of `TransactionalSpec` itself, gated on backends that support `Transaction(atomic=True, repeatable_read=True)` (Icechunk and similar):
+
+- `test_repeatable_read_consistent_snapshot`. Reads within an `atomic=True, repeatable_read=True` transaction see a consistent snapshot; concurrent writes from other transactions do not become visible mid-transaction.
+- `test_conflict_raises_transaction_failed`. Two transactions that update the same key concurrently: the first to commit succeeds; the second raises `TransactionFailed` on commit.
+- `test_generation_round_trip_on_commit`. A `put(key, value)` inside an `atomic=True` transaction produces a `PutResult` whose `generation` matches what a subsequent `get(key)` returns outside the transaction.
+- `test_failed_transaction_does_not_leak_writes`. After `TransactionFailed` is raised, none of the transaction's staged writes are observable to any subsequent read through any store handle.
+- `test_atomic_multi_key_commit_under_concurrency`. A multi-key transaction commits all keys or none, even when a concurrent writer is touching one of the keys mid-commit.
 
 ### `GetStreamingSpec`, `GetRangeStreamingSpec`, `ZeroCopyGetStreamingSpec`
 

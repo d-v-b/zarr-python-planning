@@ -21,7 +21,7 @@ read_array_metadata(store, path) -> ArrayMetadata
 write_array_metadata(store, path, metadata: ArrayMetadata) -> None
 read_group_metadata(store, path) -> GroupMetadata
 write_group_metadata(store, path, metadata: GroupMetadata) -> None
-read_consolidated_metadata(store, root) -> ConsolidatedMetadata | None
+read_consolidated_metadata(store, path) -> ConsolidatedMetadata | None
 ```
 
 These translate hierarchy paths into store-key reads/writes of the canonical metadata documents (`zarr.json` in V3, `.zarray` / `.zgroup` / `.zattrs` in V2). The store layer sees the keys; the hierarchy layer knows *which keys mean what*.
@@ -29,19 +29,20 @@ These translate hierarchy paths into store-key reads/writes of the canonical met
 ### Hierarchy verbs
 
 ```python
-list_children(store, group_path) -> Iterator[ChildName]
+list_children(store, path) -> Iterator[ChildName]
 node_exists(store, path) -> bool
 node_kind(store, path) -> Literal["array", "group", "absent"]
-walk_hierarchy(store, root) -> Iterator[Path]
+walk_hierarchy(store, path) -> Iterator[Path]
 delete_node(store, path) -> None      # recursive for groups
 ```
+
+The `path` argument identifies an arbitrary hierarchy node; the root is just the special case `path=""` (or `"/"`, depending on convention). No verb uses a distinct `root` parameter name; reserving that vocabulary for a specific "the hierarchy root, not any node" meaning would be confusing.
 
 These are the verbs `Group.__iter__`, `Group.__contains__`, and `Group.tree()` decompose into. They know about the V2/V3 layout convention; the store layer just sees `list(prefix=...)` and `delete(key)`.
 
 ### Chunk verbs
 
 ```python
-chunk_key(metadata, coords) -> str
 chunk_exists(store, metadata, coords) -> bool
 chunk_byte_range(store, metadata, coords) -> StoreByteRange
 read_chunk(store, metadata, coords, codecs, selection=None) -> ChunkData
@@ -51,6 +52,17 @@ write_selection(store, metadata, selection, data, codecs) -> None
 ```
 
 These run the codec pipeline over store reads/writes for chunk-shaped data. They are what [lazy-indexing.md § Selection pushdown through the codec pipeline](./lazy-indexing.md#selection-pushdown-through-the-codec-pipeline) and [performance.md § 1](./performance.md#1-concurrency-is-typed-library-owned-and-shared-across-nested-calls) consume. The `selection` argument carries the pushdown.
+
+#### Pure metadata helpers
+
+Some operations are pure functions over metadata — they don't touch the store at all, but they belong in the same conceptual group as the chunk verbs because they're what callers reach for alongside `read_chunk` and friends:
+
+```python
+chunk_key(metadata, coords) -> str
+chunk_grid_shape(metadata) -> tuple[int, ...]
+```
+
+These live in [`zarr-metadata`](./functional-core.md#the-packages) as pure functions; they are listed here as part of the same surface for discoverability, but engines do not implement them differently — there's only one correct answer, computable from the metadata document alone.
 
 These are a superset of the four engine functions named loosely in [functional-core.md § A thin imperative shell](./functional-core.md#a-thin-imperative-shell-with-engines-as-namespaces). Making them the engine boundary, plus adding the metadata and hierarchy verbs, is the substantive change here.
 
@@ -89,7 +101,7 @@ The cache layering question that motivated this proposal becomes mechanical once
 | Encoded-bytes cache | `store.get`, `store.get_range`, `store.get_ranges` | Store layer | The store knows about bytes-at-keys. No hierarchy knowledge needed. |
 | Negative-result cache | `store.get` → `KeyError` | Store layer | Same — key-level negative results. |
 | Metadata cache | `read_array_metadata`, `read_group_metadata` | Hierarchy layer | Knows that the cached value is a parsed metadata document, not arbitrary bytes. Can revalidate via ETags on the underlying store call. |
-| Decoded-chunk cache | `read_chunk` | Hierarchy layer | The cached value is a decoded chunk array, not bytes. Keyed by `(array_path, chunk_coords)`, not by store key. |
+| Decoded-chunk cache | `read_chunk` only (not `read_selection`) | Hierarchy layer | The cached value is a decoded chunk array, not bytes. Keyed by `(array_path, chunk_coords)`, not by store key. A `read_selection` call hits the cache via the per-chunk `read_chunk` calls it decomposes into; the planner inspects the cache when building the IO plan so already-cached chunks generate no IO. |
 | Shard-index cache | (inside the sharding codec) | Codec layer | The shard index is internal to how the sharding codec evaluates `read_chunk` — invisible above. |
 | Partial-decoder cache | (inside the codec chain) | Codec layer | Per-call lifetime; managed by the codec pipeline. |
 | In-flight dedup | Substrate (every layer) | Shared substrate | Each layer's cache uses the same substrate's in-flight table. No layering violation; the substrate is below all of them. |
@@ -137,7 +149,7 @@ This proposal **clarifies** several others without invalidating them. Specifical
 
 - **Verb naming.** The names above (`read_array_metadata`, `write_chunk`, etc.) are illustrative. The convention — verb-prefix style (`read_*`, `write_*`) vs. noun-method style — needs a small design pass. Whatever convention lands, it should be consistent across the verb set.
 - **Where the verbs physically live.** Module-level functions in a `zarr.hierarchy` package? Methods on an `Engine` protocol? A `HierarchyOps` class injected into `Array` / `Group`? Each has tradeoffs (functions are simplest, methods are easiest to extend per-engine, injected classes are easiest to test). Defer until the implementation PR; the *semantics* are the proposal, the dispatch mechanism is implementation.
-- **Granularity of the `read_selection` verb.** It's a coarser verb than `read_chunk`; the planner (per lazy-indexing.md) consumes it directly. Whether `read_selection` is a *defined* verb at this layer (engines implement it as a primitive) or a *derived* operation (engines implement `read_chunk`; `read_selection` is sugar over chunk iteration) is the same question TensorStore answers via its `IndexTransform` machinery. We probably want both — engines that can do `read_selection` primitively (TensorStore, `zarrs`) advertise it; engines that can't (a simple Python engine) get a derived implementation that calls `read_chunk` repeatedly.
+- **Granularity of the `read_selection` verb.** It's a coarser verb than `read_chunk`; the planner (per lazy-indexing.md) consumes it directly. Whether `read_selection` is a *defined* verb at this layer (engines implement it as a primitive) or a *derived* operation (engines implement `read_chunk`; `read_selection` is sugar over chunk iteration) is the same question TensorStore answers via its `IndexTransform` machinery. We probably want both — engines that can do `read_selection` primitively (TensorStore, `zarrs`) advertise it; engines that can't (a simple Python engine) get a derived implementation that calls `read_chunk` repeatedly. The cache-stratification choice above (decoded-chunk cache wraps `read_chunk` only, not `read_selection`) is independent of this and stands regardless of how the verb resolves: cache lookups happen at the chunk granularity because that's the granularity at which Zarr stores data; the planner is responsible for consulting the cache when assembling a selection's IO plan.
 - **Hierarchy-layer conformance suite.** Mirrors [stores-conformance.md](./stores-conformance.md) in shape: per-verb spec classes, parameterized over engines and over backing-store fixtures. Out of scope for this proposal; expected as a follow-on once the verbs are settled.
 - **Transactional semantics across verbs.** A multi-verb operation (write metadata + write chunks) wants atomicity. Today this rides on `Transactional[S]` at the store layer ([stores-transactional.md](./stores-transactional.md)); the hierarchy layer needs to surface "open a transaction" as a verb that wraps the underlying store transaction. The shape of that wrapper is open.
 - **Async variants.** Same story as the store layer (`stores-api.md`): every sync verb gets an `Async` variant; the sync/async bridge wrappers cross between them. Naming and dispatch mirror what's already specified for the store layer.
