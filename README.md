@@ -41,7 +41,7 @@ We largely achieved those goals: compared to Zarr-Python 2.18 (the last release 
 
 We hit these marks while retaining a very high degree of backwards compatibility with the 2.x APIs. Some Zarr-Python consumers are still migrating to 3.x, but large downstream libraries like `Xarray` and `dask` managed the transition relatively easily.
 
-Over 1 year since the 3.0 release, I feel comfortable stating that the 2.x -> 3.0 transition is effectively resolved. 
+Over 1 year since the 3.0 release, we feel comfortable stating that the 2.x -> 3.0 transition is effectively resolved.
 
 So what's next for `Zarr-Python`?
 
@@ -49,9 +49,9 @@ So what's next for `Zarr-Python`?
 
 Our old Zarr-Python 3.0 goals are accomplished. That means it's time to define Zarr-Python 4.0 in terms of some new goals. 
 
-If the 3.0 goals could be sloganized as "Migrate to Zarr V3, and improve cloud storage support", I propose the following slogan for the 4.0 goals: "Support a Zarr-based Python ecosystem for chunked arrays". The Zarr-Python project should be *foundational* for the increasingly large number of Python packages that work with data in the Zarr format. We want to position Zarr Python packages as viable core components for *any* project that works with Zarr data.
+If the 3.0 goals could be sloganized as "Migrate to Zarr V3, and improve cloud storage support", we propose the following slogan for the 4.0 goals: "Support a Zarr-based Python ecosystem for chunked arrays". The Zarr-Python project should be *foundational* for the increasingly large number of Python packages that work with data in the Zarr format. We want to position Zarr Python packages as viable core components for *any* project that works with Zarr data.
 
-To reach this I think we should push in the following directions:
+To reach this we should push in the following directions:
 
 - Give Zarr-Python users excellent performance, out of the box. 
 - Make Zarr-Python APIs ergonomic and useful for developers. 

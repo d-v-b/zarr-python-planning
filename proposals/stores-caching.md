@@ -31,7 +31,7 @@ Two strategies were considered:
 1. **Object-level caching with local slicing.** Every `get_range(key, ...)` call promotes to `get(key)` on the first hit, caches the full object, and serves subsequent range requests by local slicing. Maximally effective for repeated overlapping reads; memory cost is unbounded by range size and surprising for callers with very large objects.
 2. **Cache exactly what was requested.** `get_range(key, start=0, end=50)` and `get_range(key, start=0, end=60)` are different cache keys; `get(key)` is yet another. No promotion, no slicing. Memory cost is bounded by what the caller actually requested. Less effective when read patterns vary across slices but doesn't surprise.
 
-I propose strategy 2. The reason: Zarr's read patterns are deterministic per selection, so the "different cache keys for slightly different ranges" failure mode is rare in practice; the predictability of the cache footprint is worth more than the marginal hit-rate gain from local slicing. If a real workload demands object-level caching, it can be added behind a constructor flag (`promote_to_object: bool = False`) without changing the default contract.
+We propose strategy 2. The reason: Zarr's read patterns are deterministic per selection, so the "different cache keys for slightly different ranges" failure mode is rare in practice; the predictability of the cache footprint is worth more than the marginal hit-rate gain from local slicing. If a real workload demands object-level caching, it can be added behind a constructor flag (`promote_to_object: bool = False`) without changing the default contract.
 
 ## API
 

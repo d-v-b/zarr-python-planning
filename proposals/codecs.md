@@ -8,11 +8,11 @@ In addition to the packaging issues addressed in [functional-core.md](./function
 - Many popular Zarr V2 codecs have no Zarr V3 equivalent.
 - The role of the Numcodecs package in the context of Zarr V3 is unclear.
 
-I will expand on these issues individually and propose solutions. One family of solutions takes the form of a total codec class rewrite.
+We expand on these issues individually and propose solutions. One family of solutions takes the form of a total codec class rewrite.
 
 ## The codec API is unwieldy and inefficient
 
-The structure of the [`Codec` base class](https://github.com/zarr-developers/zarr-python/blob/520344adc7843f3b56eba51269d265ddeed3c44b/src/zarr/abc/codec.py#L85) in Zarr Python has a few issues worth fixing, which I enumerate here. Many of these issues could be addressed by incremental changes to the existing `Codec` base class, but I propose a more drastic replacement -- a full rewrite of the codec API, with a backwards-compatibility layer.
+The structure of the [`Codec` base class](https://github.com/zarr-developers/zarr-python/blob/520344adc7843f3b56eba51269d265ddeed3c44b/src/zarr/abc/codec.py#L85) in Zarr Python has a few issues worth fixing, enumerated below. Many of them could be addressed by incremental changes to the existing `Codec` base class, but we propose a more drastic replacement -- a full rewrite of the codec API, with a backwards-compatibility layer.
 
 ### Unnecessary async encode / decode routines
 
@@ -61,7 +61,7 @@ Our codec abstract base classes are not abstract. They define concrete implement
 
 Solution: avoid defining implementations in a data structure that is supposed to be abstract. 
 
-In this case, I think re-writing all our pseudo-abstract base classes as completely abstract, structurally-typed protocols is the right choice. A protocol-based approach would weaken the coupling between Zarr-Python and codec implementations and allow a richer expression of codecs with different capabilities. And a clear separation between interface and implementation will make the codec behavior easier for developers to understand.
+In this case, re-writing all our pseudo-abstract base classes as completely abstract, structurally-typed protocols is the right choice. A protocol-based approach would weaken the coupling between Zarr-Python and codec implementations and allow a richer expression of codecs with different capabilities. And a clear separation between interface and implementation will make the codec behavior easier for developers to understand.
 
 ### Codecs must allocate memory for their outputs
 
