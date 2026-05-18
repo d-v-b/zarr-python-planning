@@ -55,19 +55,17 @@ To reach this I think we should push in the following directions:
 - Support the growth of Python tools across all levels of the Zarr stack.  
 - Accelerate the implementation of new codecs, chunk grids, chunk key encodings, etc. 
 
-## What I'm afraid of
+## Why now
 
-The risk under the both-and framing above is that we *under-invest* in the pure-Python mode, and the "the pure-Python path is good enough that the FFI engines are an optimization, not a necessity" claim stops being true. If Zarr-Python is too slow to improve performance, add features, and make APIs better, users will adopt other Python tools like Tensorstore, or simply not use Zarr at all. We have a lot of inertia, thanks to projects like Dask and Xarray, but that can change *very quickly* if someone motivated stands up a cleaner, faster, better Python-based Zarr library. We should run that cleaner, faster, better library. The following sections outline my vision for how we can make that happen.
+Two things make 4.0 the right moment for this work — one a risk, one an asset — and together they argue for moving now rather than later.
 
-## Why we can move fast now
+**The risk: under-investment in the pure-Python mode collapses the both-and framing.** The "pure-Python path is good enough that the FFI engines are an optimization, not a necessity" claim is load-bearing for the strategic case above. If Zarr-Python is too slow to improve performance, add features, and make APIs better, users will adopt other Python tools like Tensorstore, or simply not use Zarr at all. The inertia from Dask, Xarray, and the named institutional users above is real but can change *very quickly* if someone motivated stands up a cleaner, faster, better Python-based Zarr library. We should run that cleaner, faster, better library.
 
-There is a counterweight to the fear above. Zarr-Python is in a genuinely fortunate position relative to most library-rewrite efforts: **we have two independently-written, production-quality, high-performance Zarr implementations to learn from.** [Zarrs](https://github.com/zarrs/zarrs) (Rust) and [TensorStore](https://github.com/google/tensorstore) (C++/Google) were written by different teams, in different languages, against different design constraints, with no coordination between them. And they have *converged* on the same architectural patterns — sync-first codec APIs with async as an opt-in adapter; per-codec advertised concurrency budgets; sharded reads with adaptive whole-shard-vs-coalesced strategies; pre-allocated decode buffers; per-key in-flight deduplication; conditional reads with ETag-style generations; pipeline caches inserted between codecs that lack partial-decode support. When two independent reference implementations agree on something this specific, the case for adopting it is much stronger than any one team's design instincts.
-
-This is the rare situation where the hard architectural questions have already been answered for us. We do not have to invent; we have to translate.
+**The asset: two independent reference implementations have already answered the hard architectural questions.** [Zarrs](https://github.com/zarrs/zarrs) (Rust) and [TensorStore](https://github.com/google/tensorstore) (C++/Google) were written by different teams, in different languages, against different design constraints, with no coordination between them. And they have *converged* on the same architectural patterns — sync-first codec APIs with async as an opt-in adapter; per-codec advertised concurrency budgets; sharded reads with adaptive whole-shard-vs-coalesced strategies; pre-allocated decode buffers; per-key in-flight deduplication; conditional reads with ETag-style generations; pipeline caches inserted between codecs that lack partial-decode support. When two independent reference implementations agree on something this specific, the case for adopting it is much stronger than any one team's design instincts. We do not have to invent; we have to translate.
 
 That translation work has been **vastly accelerated by large language models.** Reading a 200-thousand-line C++ codebase and a 50-thousand-line Rust codebase to extract their architectural patterns — what each library does, why it does it, how the pieces compose, what's load-bearing vs. incidental — is exactly the kind of cross-codebase synthesis that used to take weeks of senior engineering time and now takes hours. Most of the comparative analysis cited in the proposals below ([codecs.md](./proposals/codecs.md), [stores.md](./proposals/stores.md), [performance.md](./proposals/performance.md)) was assembled with LLM-driven code reading, source-grep, and synthesis loops. The technical work — designing the new APIs, writing the migration plans, building the implementations — is still ours to do, and the LLM-assisted findings have been verified against the source by hand for the load-bearing claims. But the *discovery* phase, which historically dominated the cost of a project like this, has collapsed to a fraction of what it once was.
 
-The combination — two reference implementations we can learn from, plus tools that let us extract their lessons cheaply — is why a project this ambitious is realistic on a 4.0 timeframe rather than being a multi-year research effort. We are not designing in the dark; we are catching up to two libraries that have already done most of the hard thinking. The proposals below reflect the *current* state of that translation: the substantial themes (Functional Core, Hierarchy Layer, Codecs, Stores, Lazy Indexing, Performance, Observability, Device-agnostic IO, Data types) are fleshed out; one stub (Consolidated metadata) remains as a placeholder for the next pass and is not blocked on discovery, only on writing time.
+The combination — a real risk if we don't move, plus two reference implementations to learn from and tools that let us extract their lessons cheaply — is why a project this ambitious is realistic on a 4.0 timeframe rather than being a multi-year research effort. The proposals below reflect the *current* state of that translation: the substantial themes (Functional Core, Hierarchy Layer, Codecs, Stores, Lazy Indexing, Performance, Observability, Device-agnostic IO, Data types) are fleshed out; one stub (Consolidated metadata) remains as a placeholder for the next pass and is not blocked on discovery, only on writing time.
 
 ## Why this work is overdue
 
@@ -107,18 +105,6 @@ Zarr-Python is not a hobby project, and the institutions whose work depends on i
 
 The picture is unusual: a single open-source library that anchors **published petabyte-scale climate archives, an international bioimaging standard, an NIH-funded neurophysiology archive, a commercial product, and substantial parts of the Python ML-physics stack at NVIDIA, Apple, Google, and ECMWF**. Each of these depends on Zarr-Python remaining good. The 4.0 work is the investment that lets it keep being good.
 
-## Foundation: a functional core
-
-Several themes below depend on a common substrate: a refactor of Zarr-Python's internals around a *functional core* — pure data structures and pure functions for the algebra of Zarr (metadata, chunk layouts, slice planning, codec walking) — with the side-effecting protocols (stores, codecs) at the edges. This is itself an internal change, not something user-facing. It is foundational for the Codecs and Stores themes, it shapes the per-level package split (`zarr-metadata`, `zarr-store`, `zarr-codec`, `zarr-dtype`) covered inside the functional-core proposal itself, and it unlocks the high-performance integration story for Zarrs and TensorStore by providing a clean substrate for engine-level pluggability.
-
-→ [proposals/functional-core.md](./proposals/functional-core.md)
-
-## Foundation: a formal hierarchy layer
-
-The other foundational piece is a formal **hierarchy layer** that sits between the store API (key-agnostic bytes) and the user-facing `Array` / `Group` facade. Today the hierarchy layer exists implicitly — it's whatever `Array` and `Group` happen to do — but it's not named, not specified, and not engine-pluggable in the way the codec layer and the store layer are. This proposal makes it a typed surface: a small set of verbs (`read_array_metadata`, `write_chunk`, `list_children`, `read_selection`, ...) that take a store and a hierarchy-shaped intent. Alternative engines implement the verbs end-to-end (not just chunk reads); hierarchy-aware caching wraps them; the chunk-introspection user surface in [observability.md](./proposals/observability.md) is the verbs exposed on `Array`. Naming this layer resolves several abstraction ambiguities that have been leaking across the proposal set, most visibly in the cache-layering question.
-
-→ [proposals/hierarchy-layer.md](./proposals/hierarchy-layer.md)
-
 ## The Zarr Stack
 
 There are levels of Zarr support. Some applications, like validators for domain-specific Zarr conventions, only need to read Zarr metadata documents. They don't need to read and write chunks. Other applications might only need read-only access to array metadata and the stored chunks, and nothing else. Tensorstore only supports reading and writing arrays, but not the `attributes` field of Zarr metadata, and it doesn't support any operations on Zarr groups. Zarr Python supports all types of operations -- reading and writing arrays and groups -- but doesn't support exactly the same set of data types and codecs as other "complete" implementations. 
@@ -148,7 +134,19 @@ The 4.0 direction is to re-shape `zarr-python` around the stack: each level is s
 
 This reframes our 4.0 goal of *"support Python tools across all levels of the Zarr stack"* from a slogan into a concrete commitment: every level has a named package, a documented interface, and a conformance suite. It also reframes high-performance backends from competitors to **peers at specific levels** — a user can keep `zarr-python`'s metadata, hierarchy, and indexing while routing chunk reads through Zarrs.
 
-The mechanism for this re-shaping is the [functional-core refactor](./proposals/functional-core.md), which extracts the pure-data and pure-function parts of each level out of the monolith and into independently usable pieces.
+The mechanism for this re-shaping is the two foundational pieces of work described in the next two sections: the **functional-core refactor** (pure-data layer) and the **formal hierarchy layer** (typed verbs over the store API). Together they extract the pure-data and pure-function parts of each stack level out of the monolith and into independently usable pieces.
+
+## Foundation: a functional core
+
+The first foundational piece is a refactor of Zarr-Python's internals around a *functional core* — pure data structures and pure functions for the algebra of Zarr (metadata, chunk layouts, slice planning, codec walking) — with the side-effecting protocols (stores, codecs) at the edges. This is itself an internal change, not something user-facing. It is what makes the per-level package split (`zarr-metadata`, `zarr-store`, `zarr-codec`, `zarr-dtype`) implementable, and it unlocks the high-performance integration story for Zarrs and TensorStore by providing a clean substrate for engine-level pluggability.
+
+→ [proposals/functional-core.md](./proposals/functional-core.md)
+
+## Foundation: a formal hierarchy layer
+
+The second foundational piece is a formal **hierarchy layer** that sits between the store API (key-agnostic bytes) and the user-facing `Array` / `Group` facade — corresponding to the boundary between the Stores level (6) and the Groups/Arrays levels (2–3) above. Today the hierarchy layer exists implicitly — it's whatever `Array` and `Group` happen to do — but it's not named, not specified, and not engine-pluggable in the way the codec layer and the store layer are. This proposal makes it a typed surface: a small set of verbs (`read_array_metadata`, `write_chunk`, `list_children`, `read_selection`, ...) that take a store and a hierarchy-shaped intent. Alternative engines implement the verbs end-to-end (not just chunk reads); hierarchy-aware caching wraps them; the chunk-introspection user surface in [observability.md](./proposals/observability.md) is the verbs exposed on `Array`. Naming this layer resolves several abstraction ambiguities that have been leaking across the proposal set, most visibly in the cache-layering question.
+
+→ [proposals/hierarchy-layer.md](./proposals/hierarchy-layer.md)
 
 ## What we're changing
 
@@ -214,6 +212,19 @@ The proposals above describe *what* changes; this section describes *when* and *
 
 A reader who wants the granular per-proposal sequencing should follow the links into the proposals themselves; each substantial proposal has its own migration / sequencing section. What follows is the release-shaped view of how those plans compose.
 
+### Phases mapped to releases
+
+| Phase | Release target | Approximate scope |
+|---|---|---|
+| **Phase 0** — Foundation | **4.0** | functional-core refactor, per-level package split, stores API rewrite, formal hierarchy layer, `IndexTransform` algebra ([zarr#3906](https://github.com/zarr-developers/zarr-python/pull/3906), already in flight) |
+| **Phase 1** — Performance and concurrency | **4.x** (incremental minor releases on top of 4.0) | codec API rewrite, typed concurrency resources, cache substrate, store-layer range coalescing and conditional reads |
+| **Phase 2** — User-facing surface | **4.x** (continuing) | Array API conformance + query planner, device-agnostic IO, observability, missing APIs (explicit constructors, typed exceptions, rich reprs, etc.). The default flip from eager to lazy `__getitem__` ships in a Phase 2 release. |
+| **Phase 3** — Ecosystem | **4.x → 5.0** | ML dtype support, engine wrappers for `zarrs` and TensorStore, Arrow integration investigation. The 5.0 release boundary is where the eager `__getitem__` path is removed (per [lazy-indexing.md § Migration](./proposals/lazy-indexing.md#migration)). |
+
+Phases are not gated on calendar dates; the work ships when it's ready. The release column above describes which *kind* of release each phase corresponds to (a major 4.0 vs incremental 4.x minor releases vs the 5.0 break), not when.
+
+The phases below describe the per-work-package contents of each release tier.
+
 ### Phase 0 — Foundation (lands first; required by everything else)
 
 The structural work that the rest of the plan depends on. Until this lands, the other phases can be designed in parallel but cannot ship.
@@ -265,3 +276,28 @@ The phases are not strict serial dependencies. Within a phase, items can ship in
 What this means for a reader trying to estimate the work: Phase 0 is the gate. Once functional-core, packaging, and the stores API rewrite are landed, the rest of the plan ships incrementally as the team works through it. There is no "big push" needed; each subsequent work package can be a focused minor release.
 
 The pure-Python performance work (Phase 1) is the load-bearing pitch for "Zarr-Python continues to be worth using as more than a compatibility shim." If we ship Phase 0 and stall on Phase 1, the [both-and framing](#why-zarr-python-exists) collapses. If we ship Phase 1, everything downstream is incremental on top.
+
+## Next steps
+
+The proposals above describe what we want to do. Three groups of readers can move this forward; the asks for each are different.
+
+### If you fund open-source science software
+
+Zarr-Python is the kind of foundational infrastructure project that produces outsized leverage when it's funded well — a single library that anchors petabyte-scale climate archives, an international bioimaging standard, an NIH-funded neurophysiology archive, a commercial product, and substantial parts of the Python ML-physics stack (see [Who funds and depends on this work](#who-funds-and-depends-on-this-work) for the specifics). The 4.0 work proposed here is the structural investment that lets the library keep being good for those users, and the kind of investment that the urgent feature work of normal release cycles rarely accommodates.
+
+**If your organization funds open-source scientific software** — whether through a structured program (CZI EOSS, NSF CSSI, NumFOCUS, Wellcome) or through direct support — **the maintainers would value the chance to discuss this work with you.** A specific resource ask (FTE-quarters by phase, named deliverables, success metrics) is being prepared and is available on request. Reach out via [the project's GitHub org](https://github.com/zarr-developers) or to the maintainers directly.
+
+### If you contribute to Zarr-Python or the surrounding ecosystem
+
+The proposal set is sized for collective work, not one team. Specific entry points:
+
+- **The lazy-indexing PR** ([zarr#3906](https://github.com/zarr-developers/zarr-python/pull/3906)) is in flight. Review, testing, and feedback are welcome now. It is the first piece of Phase 0 to ship.
+- **The individual proposals** are the discussion venue for the rest of the work. Each substantial proposal — [functional-core.md](./proposals/functional-core.md), [stores.md](./proposals/stores.md), [hierarchy-layer.md](./proposals/hierarchy-layer.md), [codecs.md](./proposals/codecs.md), [performance.md](./proposals/performance.md), [lazy-indexing.md](./proposals/lazy-indexing.md), [observability.md](./proposals/observability.md), [gpu.md](./proposals/gpu.md), [data-types.md](./proposals/data-types.md) — has its own open-questions section. Comments and counter-proposals on those are the natural way in.
+- **The smaller stubs** ([consolidated-metadata.md](./proposals/consolidated-metadata.md)) are placeholders awaiting expansion. Domain expertise on consolidated metadata is particularly welcome.
+- **The Zarr V3 spec process** is where decisions that cross language boundaries land. Several open questions in the proposals above (persisted hierarchy links, ML dtype identifiers, the cache-tier conventions) ultimately need [Zarr Enhancement Proposals](https://zarr.dev/zeps/). Spec-side participation matters.
+
+### If your project depends on Zarr-Python
+
+The most useful thing downstream maintainers can do is **weigh in on the proposals while the design is still movable**. If your project's use of Zarr-Python would be affected by any of the work proposed here — the codec API rewrite, the stores rewrite, the lazy-indexing default-flip — read the relevant proposal and comment on it. The migration commitments below are written assuming downstream readiness; if there are workloads or patterns that don't fit, the planning phase is when to surface them.
+
+The [`yaozarrs`, `mesh-n-bone`, `xcube-resampling`, `ngff-zarr`](./proposals/functional-core.md#parts-of-zarr-python-cannot-be-used-in-isolation) story (downstream projects that routed *around* Zarr-Python for various reasons) is exactly what the functional-core and packaging work aim to fix. If your project is on that list — explicitly or in spirit — the 4.0 work is partly for you, and your input on whether it actually solves your problem is load-bearing.
