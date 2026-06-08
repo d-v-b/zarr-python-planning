@@ -8,7 +8,7 @@ This document is a scaffolding for the store-layer redesign described in the [St
 4. Sync is the default; async is an opt-in protocol family, not a baked-in assumption.
 5. Path handling is verbatim with an opt-in validator; backend-specific stores can enforce stricter constraints internally.
 
-This is a sketch of the 4.0 work. The migration story at the end describes how to get from today's `Store` ABC to this design without an abrupt break: the additive surface ships across the 3.x line (Stream 1), the superseded surfaces are deprecated across that line (Stream 2), and the removals are concentrated in the single late major (Stream 3).
+This is a sketch of the v4 work. The migration story at the end describes how to get from today's `Store` ABC to this design without an abrupt break: the additive surface ships across the 3.x line (Stream 1), the superseded surfaces are deprecated across that line (Stream 2), and the removals are concentrated in the single late major (Stream 3).
 
 ## Capability protocols
 
@@ -1505,7 +1505,7 @@ with ZipStore("data.zip", mode="r") as zs:
 
 ## Migration shims and deprecation surface
 
-The above is the 4.0 design. To get there without an abrupt break, the public-facing plan should be — additive surface shipping as 3.x minors (Stream 1), the surfaces it supersedes deprecated across the 3.x line (Stream 2), and the legacy `Store` ABC plus the surfaces it carries removed in the single late major (Stream 3):
+The above is the v4 design. To get there without an abrupt break, the public-facing plan should be — additive surface shipping as 3.x minors (Stream 1), the surfaces it supersedes deprecated across the 3.x line (Stream 2), and the legacy `Store` ABC plus the surfaces it carries removed in the single late major (Stream 3):
 
 - **Keep `Store` as a typing alias for the union of common capabilities** across the 3.x line while the legacy surface is deprecated (Stream 2). Code that currently writes `store: Store` continues to type-check. The alias is removed in the single late major (Stream 3).
 - **`FsspecStore`, `LocalStore`, `MemoryStore`, `ObstoreStore` keep their current names** and grow toward the proposed shapes incrementally. The biggest user-visible deltas are that read methods return `memoryview` instead of `Buffer` (the per-call `prototype` argument is dropped, with the existing `prototype.buffer.from_bytes` wrapping happening at the codec-pipeline / array layer rather than inside each store), and that most methods become sync by default. See the [README subsection on prototype decoupling](../README.md#decoupling-prototype-from-the-read-api) and the [return-type subsection](../README.md#returning-memoryview-from-store-read-methods) for the rationale and step-by-step migration plan.

@@ -286,7 +286,7 @@ The cache substrate is one base class: a dict keyed by entry-key holding `(value
 
 (The document-level [Open questions](#open-questions) covers cross-cutting concerns; these are caching-only.)
 
-- **Per-process vs shared-memory.** Cross-process caching ([zarr#3488](https://github.com/zarr-developers/zarr-python/discussions/3488)) is out of scope for the 4.0 work but should not be designed *away* — the substrate should leave room.
+- **Per-process vs shared-memory.** Cross-process caching ([zarr#3488](https://github.com/zarr-developers/zarr-python/discussions/3488)) is out of scope for the v4 work but should not be designed *away* — the substrate should leave room.
 - **TTL vs LRU vs hybrid eviction.** LRU works for most caches; the negative-result and metadata caches want TTL when the backend lacks storage generations. Pluggable eviction policy is the cleanest answer.
 - **Interaction with Dask workers.** Each worker has its own process; without shared-memory caching, the chunk cache is per-worker. May want explicit guidance for Dask users on cache sizing.
 - **Tuning the `interactive` preset.** What does the preset turn on beyond chunk caching? Encoded-chunk caching too? Larger metadata budget? The preset is a useful escape hatch but its contents need to be decided.
