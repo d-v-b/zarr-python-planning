@@ -8,7 +8,7 @@ This document is a scaffolding for the store-layer redesign described in the [St
 4. Sync is the default; async is an opt-in protocol family, not a baked-in assumption.
 5. Path handling is verbatim with an opt-in validator; backend-specific stores can enforce stricter constraints internally.
 
-This is a 4.0-shaped sketch. The migration story at the end describes how to get from today's `Store` ABC to this design without an abrupt break.
+This is a sketch of the 4.0 work. The migration story at the end describes how to get from today's `Store` ABC to this design without an abrupt break: the additive surface ships across the 3.x line (Stream 1), the superseded surfaces are deprecated across that line (Stream 2), and the removals are concentrated in the single late major (Stream 3).
 
 ## Capability protocols
 
@@ -616,12 +616,12 @@ for stream, target in zip(streams, target_buffers):
 
 ### Migration
 
-This subsection's commitments are additive:
+This subsection's commitments are additive — they ship as 3.x minors (Stream 1), with no removals of their own:
 
 - The `GetStreaming` / `GetRangeStreaming` / `GetRangesStreaming` protocols are new.
 - `ReadStream` is a new class.
-- The `prototype: BufferPrototype` argument on existing `Get` methods continues to be deprecated per the [README's decoupling-prototype subsection](../README.md#decoupling-prototype-from-the-read-api).
-- No backend is required to implement `GetStreaming` in the initial release. The protocol is the slot for streaming-capable backends.
+- The `prototype: BufferPrototype` argument on existing `Get` methods continues to be deprecated across the 3.x line (Stream 2), and removed in the single late major (Stream 3), per the [README's decoupling-prototype subsection](../README.md#decoupling-prototype-from-the-read-api).
+- No backend is required to implement `GetStreaming` in the minor that first ships it (an additive 3.x minor, Stream 1). The protocol is the slot for streaming-capable backends.
 - `LocalStore` and `MemoryStore` can implement `GetStreaming` for free (open file handle, slice over internal bytes); shipping these as the reference implementations validates the protocol shape.
 - `ObstoreStore` and async-fsspec backends are the ones that benefit most; their existing streaming APIs map directly onto `read_into`.
 
@@ -635,7 +635,7 @@ This subsection's commitments are additive:
 - **Generation stability mid-stream.** The contract says `generation` is stable for the lifetime of the stream. Backends that detect mid-stream changes (HTTP `If-Match` failure, S3 ETag drift) should raise rather than deliver inconsistent bytes. Backends that cannot detect (fsspec over a backend without versioning) document the limitation. Worth a per-backend audit.
 - **`Caching[GetStreaming]` cache-fill correctness.** The streaming-cache pattern captures bytes into a cache entry as they flow through. If the caller drops the stream mid-drain, the cache entry is incomplete and must not be served on subsequent reads. Provisional design: the cache wrapper marks entries as "in progress" until the stream closes successfully; partial entries are discarded. Owed in [stores-caching.md](./stores-caching.md); not yet written there.
 - **Pipelined decode integration.** The streaming surface is necessary but not sufficient for pipelined decode; the codec pipeline also has to be streaming-capable. That work belongs in the [Codecs section of the README](../README.md#codecs). The store-layer protocol is shipped first; codec adoption follows.
-- **Backwards-compatible shim.** During the migration window, the existing `Buffer`-returning `Get.get` methods can be implemented in terms of `GetStreaming` (open stream, read_full into a bytearray, wrap as Buffer). This means a backend can ship `GetStreaming` first and get the legacy surface for free. Worth flagging as the recommended migration order.
+- **Backwards-compatible shim.** While the `Buffer`/`prototype` read contract is deprecated across the 3.x line (Stream 2) ahead of its removal in the single late major (Stream 3), the existing `Buffer`-returning `Get.get` methods can be implemented in terms of `GetStreaming` (open stream, read_full into a bytearray, wrap as Buffer). This means a backend can ship `GetStreaming` first and get the legacy surface for free. Worth flagging as the recommended migration order.
 - **Cursor-style alternative for local backends.** A `GetIntoStreaming` protocol with explicit `(buffer, source_offset, dest_offset)` cursors would suit local-only backends (LocalStore, MemoryStore) better than the stateful `ReadStream`, because there's no connection to hold open. Stays open as a future addition if a real performance gap emerges; the stream-with-trivial-state pattern is fine for v1.
 
 ## Path helpers
@@ -971,14 +971,14 @@ Two new specs land in [stores-conformance.md](./stores-conformance.md):
 
 ### Migration
 
-This subsection's commitments are additive:
+This subsection's commitments are additive — they ship as 3.x minors (Stream 1), with no removals of their own:
 
 - `KeyRange` is a new dataclass; nothing currently uses it.
 - `range` argument on `List` / `ListWithDelimiter` is a new optional parameter; existing callers unchanged.
 - `bounds` property on backends is new; defaults to `KeyRange()` (unbounded) for everything that doesn't opt in.
 - `KvStack[S]` is a new wrapper; nothing has to migrate to use it.
 
-The sharding codec migration to `KvStack`-shaped composites is explicitly future work, not initial scope. Consolidated metadata migration to `KvStack`-shaped overlays is the natural validation use case for the design and can be tackled in the same release that ships `KvStack`, since consolidated metadata is independently being reconsidered (see the [README's consolidated-metadata section](../README.md#consolidated-metadata)).
+The sharding codec migration to `KvStack`-shaped composites is explicitly later work, not part of the additive 3.x minor (Stream 1) that first ships `KvStack`. Consolidated metadata migration to `KvStack`-shaped overlays is the natural validation use case for the design and can be tackled in the same minor that ships `KvStack`, since consolidated metadata is independently being reconsidered (see the [README's consolidated-metadata section](../README.md#consolidated-metadata)).
 
 ### Open questions
 
@@ -1146,7 +1146,7 @@ def make_store(
     ...
 ```
 
-`Array.store` and `Group.store` carry the result type directly. `Array.store_path` / `Group.store_path` are kept as deprecation accessors that return the same `Prefixed[S]` value during the migration window.
+`Array.store` and `Group.store` carry the result type directly. `Array.store_path` / `Group.store_path` are kept as deprecation accessors that return the same `Prefixed[S]` value while they are deprecated across the 3.x line (Stream 2), ahead of their removal in the single late major (Stream 3).
 
 ## Backend stores
 
@@ -1505,16 +1505,16 @@ with ZipStore("data.zip", mode="r") as zs:
 
 ## Migration shims and deprecation surface
 
-The above is a 4.0 design. To get there without an abrupt break, the public-facing migration plan should be:
+The above is the 4.0 design. To get there without an abrupt break, the public-facing plan should be — additive surface shipping as 3.x minors (Stream 1), the surfaces it supersedes deprecated across the 3.x line (Stream 2), and the legacy `Store` ABC plus the surfaces it carries removed in the single late major (Stream 3):
 
-- **Keep `Store` as a typing alias for the union of common capabilities** during the deprecation window. Code that currently writes `store: Store` continues to type-check.
+- **Keep `Store` as a typing alias for the union of common capabilities** across the 3.x line while the legacy surface is deprecated (Stream 2). Code that currently writes `store: Store` continues to type-check. The alias is removed in the single late major (Stream 3).
 - **`FsspecStore`, `LocalStore`, `MemoryStore`, `ObstoreStore` keep their current names** and grow toward the proposed shapes incrementally. The biggest user-visible deltas are that read methods return `memoryview` instead of `Buffer` (the per-call `prototype` argument is dropped, with the existing `prototype.buffer.from_bytes` wrapping happening at the codec-pipeline / array layer rather than inside each store), and that most methods become sync by default. See the [README subsection on prototype decoupling](../README.md#decoupling-prototype-from-the-read-api) and the [return-type subsection](../README.md#returning-memoryview-from-store-read-methods) for the rationale and step-by-step migration plan.
-- **`StorePath` becomes a deprecation alias for `Prefixed[Store]`.** Existing `StorePath(store, path)` calls return a `Prefixed(store, path)` and emit a `DeprecationWarning`. `Array.store_path` and `Group.store_path` are kept as accessors that return the same `Prefixed[S]` value as the new `Array.store` / `Group.store` attributes, with a deprecation note pointing at the new attribute names. `__truediv__` semantics are preserved verbatim so existing hierarchy-traversal code continues to work.
-- **`Store.open` classmethod and the `_is_open` / `_open` / `_ensure_open` machinery is removed.** Stateless backends (`MemoryStore`, `FsspecStore`, `ObstoreStore`) lose nothing because their `_open` was a no-op already. `LocalStore` moves its existence check to `__init__` with an opt-in `mkdir=False` flag (default raises `FileNotFoundError` if the root does not exist). `ZipStore`'s lifecycle contract is the one undecided sub-question; see the [open question on `ZipStore` lifecycle](#open-questions) below for the option space. The other stores' lifecycle resolution is independent and does not block on it. See the [README subsection on lifecycle, paths, and the future of `StorePath`](../README.md#lifecycle-paths-and-the-future-of-storepath).
-- **`with_read_only()` is removed in favor of the `ReadOnly[S]` wrapper.** During the deprecation window, `store.with_read_only(True)` returns `ReadOnly(store)` and emits a `DeprecationWarning`. The `read_only` constructor argument on every backend store is dropped at the same time; existing call sites using `LocalStore(root, read_only=True)` migrate to `ReadOnly(LocalStore(root))`.
+- **`StorePath` becomes a deprecation alias for `Prefixed[Store]`** across the 3.x line (Stream 2), removed in the single late major (Stream 3). Existing `StorePath(store, path)` calls return a `Prefixed(store, path)` and emit a `DeprecationWarning`. `Array.store_path` and `Group.store_path` are kept as accessors that return the same `Prefixed[S]` value as the new `Array.store` / `Group.store` attributes, with a deprecation note pointing at the new attribute names. `__truediv__` semantics are preserved verbatim so existing hierarchy-traversal code continues to work.
+- **`Store.open` classmethod and the `_is_open` / `_open` / `_ensure_open` machinery is removed in the single late major (Stream 3).** Stateless backends (`MemoryStore`, `FsspecStore`, `ObstoreStore`) lose nothing because their `_open` was a no-op already. `LocalStore` moves its existence check to `__init__` with an opt-in `mkdir=False` flag (default raises `FileNotFoundError` if the root does not exist). `ZipStore`'s lifecycle contract is the one undecided sub-question; see the [open question on `ZipStore` lifecycle](#open-questions) below for the option space. The other stores' lifecycle resolution is independent and does not block on it. See the [README subsection on lifecycle, paths, and the future of `StorePath`](../README.md#lifecycle-paths-and-the-future-of-storepath).
+- **`with_read_only()` is removed in favor of the `ReadOnly[S]` wrapper**, in the single late major (Stream 3). While it is deprecated across the 3.x line (Stream 2), `store.with_read_only(True)` returns `ReadOnly(store)` and emits a `DeprecationWarning`. The `read_only` constructor argument on every backend store is dropped at the same time; existing call sites using `LocalStore(root, read_only=True)` migrate to `ReadOnly(LocalStore(root))`.
 - **Wrappers are additive.** Shipping `Caching`, `RangeCoalescing`, etc. does not require removing anything.
-- **Capability protocols ship first**, before any breaking changes to existing stores. This lets downstream libraries (xarray, dask, virtualizarr) adopt protocol-based typing on their side ahead of the 4.0 cutover.
-- **The `experimental.cache_store` module retires** in favor of the `Caching` wrapper, with a deprecation warning that points at the new API.
+- **Capability protocols ship first** — as additive 3.x minors (Stream 1), ahead of any breaking removals to existing stores. This lets downstream libraries (xarray, dask, virtualizarr) adopt protocol-based typing on their side before the single late major (Stream 3) lands.
+- **The `experimental.cache_store` module retires** in favor of the `Caching` wrapper — deprecated with a warning that points at the new API across the 3.x line (Stream 2), removed in the single late major (Stream 3).
 
 The migration story for `FsspecStore` specifically is the smallest delta in the proposal: the existing class keeps the same constructor signature, gains a `validate_path` keyword argument with default `None`, and documents the verbatim-path contract. Everything else in the FsspecStore section is unchanged.
 
@@ -1523,12 +1523,12 @@ The migration story for `FsspecStore` specifically is the smallest delta in the 
 - **Async naming.** Resolved in favor of two protocol families with the obspec-aligned `Async` suffix on classes and `_async` suffix on methods (sync `Get` / `GetRange` / `GetRanges` / ... and async `GetAsync` / `GetRangeAsync` / `GetRangesAsync` / ...). See the [README subsection on sync-by-default](../README.md#sync-by-default-with-async-as-an-opt-in-protocol-family) for the rationale, the per-backend mapping, and the deprecation path for `zarr.core.sync.sync()`.
 - **Capability intersection types.** Python's `Protocol` does not yet support `&` (intersection) cleanly across all type checkers. The usage examples assume PEP-695-style type expressions. May need to fall back to explicit `Protocol`-merging classes (`class ReadCapable(Get, GetRange, List, Head, Protocol): ...`).
 - **`Transactional` granularity.** Resolved as a single protocol with TensorStore's external-transaction shape: `store.with_transaction(txn)` binds a free-standing `Transaction(atomic=..., repeatable_read=...)` object to the store. Snapshot-isolation is `atomic=True, repeatable_read=True` on the same `Transaction` — no separate protocol. See [stores-transactional.md](./stores-transactional.md) for the full design, per-backend support matrix, and migration plan (including the V2 rename-into-place restoration for `LocalStore`).
-- **Backwards compatibility window.** How long does the `Store` ABC remain importable? One major release? Two? Affects how aggressively wrappers can replace inheritance-based extension.
+- **Backwards compatibility window.** The `Store` ABC is removed in the single late major (Stream 3), after being deprecated across the 3.x line (Stream 2). The open question is how long that deprecation window across the 3.x line should run before the major lands — which affects how aggressively wrappers can replace inheritance-based extension.
 - **Return type.** Resolved in favor of `memoryview` over `bytes` and obspec's `Buffer`. See the [README subsection on returning `memoryview`](../README.md#returning-memoryview-from-store-read-methods) for the three-way comparison and the per-backend migration. The door stays open to upgrade to obspec's `Buffer` later if explicit lifetime semantics become necessary; the migration would be additive.
 - **Device-agnostic IO re-coupling, if it becomes necessary.** Option 1 ([stores.md](./stores.md#decoupling-prototype-from-the-read-api)) gives up zero-copy DMA into caller-allocated (e.g. GPU) buffers via the *allocating* `Get`/`GetRange` path. The full device-agnostic story is delivered by `GetStreaming` instead — see [§ Streaming and caller-allocated reads via `GetStreaming`](#streaming-and-caller-allocated-reads-via-getstreaming) above and [gpu.md](./gpu.md) for the broader framing. If we later want the allocating path to also accept caller-specified destinations, the smallest delta is option 3 from stores.md: introduce a `ReadContext` parameter that carries a `BufferPrototype`. This is strictly additive relative to option 1.
 - **`ZipStore` lifecycle contract.** Whether methods called outside a context manager should raise, warn, or be supported indefinitely. Five options are in play:
   1. **Indefinite lazy-open.** Status quo behavior preserved; context manager is documented as recommended but not required. `__del__` and pickle round-trip handle cleanup. No deprecation, no break. Lowest risk; resource-holding stores stay an explicit exception in the design (which the README already carves out).
-  2. **Deprecation cycle.** `DeprecationWarning` for one or two releases, then `RuntimeError`. Final state is uniform with the rest of the design. Cost: real ergonomic tax on distributed scheduling (dask, ray) where task functions today receive an opened store and would need to enter a context manager per task.
+  2. **Deprecation cycle.** `DeprecationWarning` across the 3.x line (Stream 2), then `RuntimeError` in the single late major (Stream 3). Final state is uniform with the rest of the design. Cost: real ergonomic tax on distributed scheduling (dask, ray) where task functions today receive an opened store and would need to enter a context manager per task.
   3. **New parallel store.** Add `StrictZipStore` alongside the existing `ZipStore`. Old class keeps lazy-open indefinitely; new class requires context manager. Variant: the protocol-based redesign's `ZipStore` is the strict one, today's `Store` ABC `ZipStore` keeps lazy-open. Migration cost is paid as part of the broader API migration rather than as a `ZipStore`-specific event.
   4. **Mode-conditional strictness.** Read mode allows lazy-open (leaking a handle is benign; the OS reclaims and the data is fine); write modes (`"w" | "a" | "x"`) require a context manager (a process exiting without close on a writable zip corrupts the central directory). Targets the actual correctness risk but introduces an asymmetric contract on one class.
   5. **Constructor flag.** `ZipStore(path, strict=False)` keeps lazy-open; `strict=True` requires context manager. Default off. Single class, opt-in. Flag becomes API surface to maintain.

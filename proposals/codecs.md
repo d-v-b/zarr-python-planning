@@ -26,6 +26,8 @@ Performance profiling of Zarr Python's codec API routinely flags this unnecessar
 
 Solution: define `encode` and `decode` as synchronous functions, and define asynchronous `encode_async` / `decode_async` for classes that can make use of this functionality. 
 
+A synchronous single-chunk path is **already merged in `zarr-python`** (`SupportsSyncCodec` / `ChunkTransform`, with `_decode_sync` / `_encode_sync` implemented on every concrete codec). Adopting it on the default array read/write path is therefore an *additive* change that does not depend on the full codec-API rewrite below or on the functional-core refactor — it ships as an additive 3.x minor (Stream 1 · M0), removing the async-wrapping hotspot now, while the rewrite that formalizes the public protocol surface ships as an additive 3.x minor in the foundation work (Stream 1 · M1 perf levers). Scope guard: this sync-adoption step keeps the existing V2-codec *read* path intact and does not touch the Numcodecs-elimination question, both of which are separate, later, and more delicate.
+
 ### Abstraction leakage in the encode / decode function signature
 
 *The codec base class defines `encode` and `decode` as batch operations*

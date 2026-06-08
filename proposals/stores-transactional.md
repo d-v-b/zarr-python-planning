@@ -8,6 +8,8 @@ The load-bearing claims are:
 
 1. **Per-key atomicity is a property of `Put`, not a transaction.** Backends that support it (most modern object stores, filesystems via rename) advertise `Put` and the contract says individual writes are atomic. `LocalStore` regains rename-into-place, restoring V2's contract.
 2. **Per-key conditional writes are a property of `Put`, not a transaction.** A `put(key, value, if_match=generation)` succeeds iff the current generation matches; the result reports the new generation or `None` if the precondition failed. This is the OCC primitive every other layer is built on.
+
+   **Safety boundary — reads vs writes are not equally safe, and this must be loud.** Conditional *reads* (`if_not_match` revalidation) are safe everywhere: their worst case on an ETag-less or `If-Match`-ignoring backend is degrading to a redundant fetch — never a wrong answer. Conditional *writes* (this OCC primitive) are **not** universally safe. A backend that returns ETags on read but silently ignores `If-Match` on write — older MinIO, some Ceph RGW configurations, many "S3-compatible" endpoints, and ETag-less fsspec backends — defeats OCC without raising, reporting `applied=True` for a write that was silently lost. The OCC promise is therefore narrowed to strongly-consistent backends and **gated on a multi-backend race-conformance test** (two racing conditional writes against each target backend; assert exactly one reports `applied=True`, zero lost updates) before any layer above is permitted to depend on it. The revalidation half (`Caching[S]`, conditional reads in `performance.md`) does not carry this gate; the write half does.
 3. **`Put.put` returns a `PutResult` carrying the post-write generation**, never `None`. `Get.get` returns a `ReadResult` carrying the read value plus its generation. The generation is a per-key, opaque token that the backend produces; it is *not* comparable across keys.
 4. **Multi-key atomicity is what `Transactional` is for.** The protocol exposes a free-standing `Transaction()` object bound to stores by `store.with_transaction(txn)`. Two boolean knobs — `atomic` and `repeatable_read` — span the isolation/atomicity space. Commit raises `TransactionFailed` if the requested guarantees cannot be delivered; backends never silently degrade.
 5. **Atomicity is delivered by adapters, not promised by stores.** Object-storage backends (`ObstoreStore`, most `FsspecStore` backends) cannot natively deliver multi-key atomicity. The pattern is to wrap them in a transactional adapter (Icechunk, or a future zarr-native equivalent) that imposes atomicity via a manifest swap. This is the same pattern TensorStore uses with OCDBT.
@@ -308,11 +310,11 @@ Per-backend test files inherit `TransactionalSpec` and provide fixtures. Backend
 
 ## Migration
 
-Restoring per-key atomicity is the smaller, immediate piece:
+Restoring per-key atomicity is the smaller, additive piece:
 
-- `LocalStore.put` rewrites to write-to-tempfile-then-replace. One-line behavioral change. Restore-V2 contract documented on the `Put` protocol. No API change. Ship in a minor release.
+- `LocalStore.put` rewrites to write-to-tempfile-then-replace. One-line behavioral change. Restore-V2 contract documented on the `Put` protocol. No API change. Ships as an additive 3.x minor (Stream 1 · M0).
 
-The structural changes ship in stages:
+The structural changes ship additively as 3.x minors (Stream 1 · M1), in this internal order:
 
 1. **`Generation`, `PutResult`, `ReadResult` types land additively.** New return types on `Get` and `Put`. Existing `bytes`-shaped callers migrate to `result.value`. The migration is mechanical and can be done backend-by-backend with deprecation shims.
 2. **`if_match` / `if_none_match` arguments on `Put`, `if_not_match` on `Get`.** Optional kwargs; no behavior change for callers that do not pass them. Backends without generation support raise on receiving these kwargs rather than silently ignoring.

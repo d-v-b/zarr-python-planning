@@ -129,7 +129,7 @@ The lesson for `zarr-python`: introduce *one* base — call it `AsyncCache` for 
 
 ### The full catalog
 
-Six caches `zarr-python` should ship in 4.0, each a specialization of the shared substrate:
+Six caches `zarr-python` should ship as additive 3.x minors (Stream 1; the cache substrate and the unconditional caches in M0/M1, the opt-in chunk caches in M1), each a specialization of the shared substrate:
 
 #### 1. Chunk cache (decoded)
 
@@ -223,7 +223,7 @@ Zarr metadata is small, changes infrequently, and is re-read on every `zarr.open
 
 The benefit is concrete. Xarray's `open_zarr(...)` re-reads the consolidated metadata document on every call; today that is a full GET, decode, and validate. With metadata caching plus ETags, repeat opens cost a 304 — the user-perceived dashboard refresh time drops from seconds to milliseconds.
 
-**Position**: the metadata cache is on by default with a small bounded budget (proposed starting point: ~10 MB, configurable; the number is a placeholder for benchmarking). Revalidation uses storage generations when the underlying store supports them (per [stores.md](./stores.md)); for stores that don't, the cache uses a short TTL (proposed starting point: ~5 seconds, configurable). When a TTL-tracked entry is read past its TTL the cache transparently re-fetches the metadata document, decodes it, and replaces the entry. There is no staleness window beyond the configured TTL.
+**Position**: the metadata cache is on by default with a small bounded budget (proposed starting point: ~10 MB, configurable; the number is a placeholder for benchmarking). Revalidation uses storage generations when the underlying store supports them (per [stores.md](./stores.md)); for stores that don't, the cache uses a short TTL (proposed starting point: ~5 seconds, configurable). When a TTL-tracked entry is read past its TTL the cache transparently re-fetches the metadata document, decodes it, and replaces the entry. On generation-bearing stores, revalidation is exact and there is no staleness window. **On generation-less stores the on-by-default cache is a behavior change that must be called out loudly:** today's behavior re-reads metadata on every open and is *never* stale, whereas a default-on TTL cache introduces a staleness window of up to the TTL. The default therefore pins to ETag/generation revalidation where available and treats the TTL fallback as opt-in with a loud note — and the metadata cache is not flipped on by default before store-layer conditional reads (revalidation) are wired, or it ships without its safety mechanism.
 
 A user with a legitimate need to disable it (test fixtures that depend on observing every read; correctness-debug sessions) does so with `array.with_caching(metadata=False)`.
 
@@ -253,7 +253,7 @@ arr = zarr.open_array("/data.zarr").with_caching(chunks="256 MB")
 
 The `Array.with_caching(...)` / `Group.with_caching(...)` methods construct the hierarchy-layer cache wrapper (per [hierarchy-layer.md](./hierarchy-layer.md)). They are sugar over the wrapper constructor; making them one-call methods means users discover them via autocomplete and documentation, not by knowing to wrap manually. A separate, key-agnostic `backend.with_caching(...)` exists on every backend ([stores-caching.md](./stores-caching.md)) for the lower-level case "cache raw bytes from this backend"; the two compose.
 
-For the cases where chunk caching is obviously right — interactive Jupyter sessions in particular — the project ships a named preset. Concretely, something along the lines of `zarr.use_preset("interactive")` (or `ZARR_PRESET=interactive` in the environment) flips a small set of defaults for that process: chunk caching on, larger metadata budget, and any other interactive-friendly settings the preset gains. The preset is a named bundle of config overrides; the configuration substrate that holds them is being redesigned (see [missing-apis.md](./missing-apis.md) — `donfig` is being retired in 4.0), but the *shape* — a preset name resolving to a bundle of overrides — survives whatever substrate replaces it. The user gains the caching with one config line; the library does not silently double the memory cost of every script that opens a Zarr array.
+For the cases where chunk caching is obviously right — interactive Jupyter sessions in particular — the project ships a named preset. Concretely, something along the lines of `zarr.use_preset("interactive")` (or `ZARR_PRESET=interactive` in the environment) flips a small set of defaults for that process: chunk caching on, larger metadata budget, and any other interactive-friendly settings the preset gains. The preset is a named bundle of config overrides; the configuration substrate that holds them is being redesigned (see [missing-apis.md](./missing-apis.md) — `donfig` is being retired as part of the foundation work (Stream 1 · M1)), but the *shape* — a preset name resolving to a bundle of overrides — survives whatever substrate replaces it. The user gains the caching with one config line; the library does not silently double the memory cost of every script that opens a Zarr array.
 
 #### Other caches in the catalog
 
@@ -286,7 +286,7 @@ The cache substrate is one base class: a dict keyed by entry-key holding `(value
 
 (The document-level [Open questions](#open-questions) covers cross-cutting concerns; these are caching-only.)
 
-- **Per-process vs shared-memory.** Cross-process caching ([zarr#3488](https://github.com/zarr-developers/zarr-python/discussions/3488)) is out of scope for 4.0 but should not be designed *away* — the substrate should leave room.
+- **Per-process vs shared-memory.** Cross-process caching ([zarr#3488](https://github.com/zarr-developers/zarr-python/discussions/3488)) is out of scope for the 4.0 work but should not be designed *away* — the substrate should leave room.
 - **TTL vs LRU vs hybrid eviction.** LRU works for most caches; the negative-result and metadata caches want TTL when the backend lacks storage generations. Pluggable eviction policy is the cleanest answer.
 - **Interaction with Dask workers.** Each worker has its own process; without shared-memory caching, the chunk cache is per-worker. May want explicit guidance for Dask users on cache sizing.
 - **Tuning the `interactive` preset.** What does the preset turn on beyond chunk caching? Encoded-chunk caching too? Larger metadata budget? The preset is a useful escape hatch but its contents need to be decided.
@@ -313,17 +313,17 @@ Resources are constructed once (defaulted by the library or supplied by the user
 
 Defaults:
 
-- `ComputeConcurrency` defaults to `os.process_cpu_count()` (or the free-threaded-Python equivalent).
-- `IoConcurrency` defaults to something larger (proposed: `min(32, 4 × cpu_count)`) because IO latency is the bottleneck, not throughput.
-- Both are configurable. The configuration substrate itself is open — the current `donfig`-based `zarr.config` is to be replaced as part of the 4.0 work; see [missing-apis.md](./missing-apis.md). The shape of the knobs is `compute_max_workers` and `io_max_workers` regardless of how they're surfaced.
+- `ComputeConcurrency` defaults to a **cgroup/affinity-aware** core count (not raw `os.process_cpu_count()`, which ignores container CPU quotas and over-allocates on a quota-limited host), drawn from a **single shared process-global pool** rather than a fresh pool per call or per array, and **conservative when nested** inside an outer scheduler (see [§ Interaction with Dask](#interaction-with-dask-and-other-host-runtimes)).
+- `IoConcurrency` is a **separate** pool sized to a latency-hiding constant **decoupled from the core count** (proposed: ~32), because IO latency, not core throughput, is the bottleneck — scaling it with `cpu_count` is wrong on both small and large machines.
+- Both are configurable. The configuration substrate itself is open — the current `donfig`-based `zarr.config` is to be replaced as part of the foundation work (Stream 1 · M1); see [missing-apis.md](./missing-apis.md). The shape of the knobs is `compute_max_workers` and `io_max_workers` regardless of how they're surfaced.
 
-This replaces today's single global `zarr.config["async.concurrency"]` integer ([config.py:103](https://github.com/zarr-developers/zarr-python/blob/main/src/zarr/core/config.py#L103)) and the singleton `_get_executor` ([sync.py:49](https://github.com/zarr-developers/zarr-python/blob/main/src/zarr/core/sync.py#L49)). The integer is gone; the pool stays (now categorized).
+This replaces today's single global `zarr.config["async.concurrency"]` integer ([config.py:103](https://github.com/zarr-developers/zarr-python/blob/main/src/zarr/core/config.py#L103)) and the singleton `_get_executor` ([sync.py:49](https://github.com/zarr-developers/zarr-python/blob/main/src/zarr/core/sync.py#L49)). The typed pools ship as an additive 3.x minor (Stream 1) alongside the old integer; the `async.concurrency` key is then deprecated (Stream 2) and removed only in the single late major (Stream 3). The integer goes away; the pool stays (now categorized).
 
 ### Interaction with Dask and other host runtimes
 
 Dask workers already manage their own thread pools and don't want `zarr-python` to spawn a competing one inside each worker. The typed-resource model makes this clean: at `Array` construction, the user (or Dask itself, via integration code) supplies `ComputeConcurrency` and `IoConcurrency` instances backed by the host's executors instead of the library defaults. The shrinking-value budget propagation still works — the call requests a slice of the supplied resource — but the actual threads come from Dask's pool, not a library singleton.
 
-This is the same shape as TensorStore's `Context` integration with external schedulers. The current "library spawns a singleton pool no one asked for" pattern is what makes the Dask integration story today require careful tuning of `async.concurrency` to avoid pool-times-pool blowup. The typed-resource model retires that class of bug.
+This is the same shape as TensorStore's `Context` integration with external schedulers. The current "library spawns a singleton pool no one asked for" pattern is what makes the Dask integration story today require careful tuning of `async.concurrency` to avoid pool-times-pool blowup. The typed-resource model retires that class of bug **when a host pool is injected** — but the *default* must also be safe, because most Dask users will not write injection code. A naive `os.process_cpu_count()` default reproduces the blowup: under the threaded scheduler ~`cpu_count` worker threads each drive zarr's shared pool (~2× core oversubscription), and under the multiprocessing scheduler ~`cpu_count` worker *processes* each spin their own ~`cpu_count`-sized pool (≈ `cpu_count²` threads box-wide). The default is therefore the cgroup-aware, shared, conservative-when-nested one specified in the Defaults list above; injection remains the path to *exact* host-pool sharing.
 
 ### Thread safety
 
@@ -368,7 +368,7 @@ Two specific implications:
 - **Free-threaded mode amplifies the win from sync-first codecs.** With the GIL, parallel codec decode is bottlenecked on GIL contention; per-chunk parallelism barely helps because every thread is fighting for the same lock. Free-threaded mode plus the §1 typed-resource model means N codec decodes can actually run in parallel — and the `ComputeConcurrency` pool's admission queue is what stops them from exceeding the configured cap.
 - **The cache substrate's in-flight dedup must use thread-safe primitives** under free-threaded mode. `asyncio.Future` and `concurrent.futures.Future` both work, but the dict mutation around them needs explicit locking that doesn't exist today under GIL assumptions.
 
-`zarr-python`'s C-extension dependencies (notably `numcodecs`) gain no-GIL support on their own schedule; the proposal here is that `zarr-python` itself does not assume the GIL, and audits any remaining `threading`-unsafe code as part of the 4.0 work.
+`zarr-python`'s C-extension dependencies (notably `numcodecs`) gain no-GIL support on their own schedule; the proposal here is that `zarr-python` itself does not assume the GIL, and audits any remaining `threading`-unsafe code as part of the foundation work (Stream 1 · M1).
 
 ### Sequencing relative to §1–§9
 
@@ -385,7 +385,7 @@ In other words, getting concurrency right is the *test* that the rest of the pro
 
 - **No `multiprocessing.shared_memory`-based shared caches across processes.** Cross-process caching is out of scope ([zarr#3488](https://github.com/zarr-developers/zarr-python/discussions/3488)), per the [caching open questions](#caching-specific-open-questions).
 - **No locking around user code.** If a user calls `array[selection] = data1` and `array[selection] = data2` concurrently from two threads, the library does not detect or prevent it. Per-key atomicity at the store layer is the contract; coordination above that is the user's job.
-- **No async-from-sync convenience helpers.** The deprecated `zarr.core.sync.sync()` and similar global bridges are removed in 4.0. Users who want to call async-only stores from sync code wrap the store in `AsyncToSync[S]` explicitly (per [stores-wrappers.md](./stores-wrappers.md)).
+- **No async-from-sync convenience helpers.** The `zarr.core.sync.sync()` bridge and similar global bridges are deprecated across the 3.x line (Stream 2) once the public `AsyncToSync` bridge ships, and removed only in the single late major (Stream 3). Users who want to call async-only stores from sync code wrap the store in `AsyncToSync[S]` explicitly (per [stores-wrappers.md](./stores-wrappers.md)).
 
 ## What is *not* portable
 

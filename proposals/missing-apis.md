@@ -18,7 +18,7 @@ Concrete asks:
 - **`copy_store` / `copy` / `copy_all`** — the v2 functions, never ported to v3 ([zarr#2407](https://github.com/zarr-developers/zarr-python/issues/2407)). Python-side; the CLI equivalent is in §5 below.
 - **Declarative hierarchy modelling and schema validation** ([zarr#2364](https://github.com/zarr-developers/zarr-python/discussions/2364)) — a way to declare "this hierarchy must contain a group X with arrays of these shapes and dtypes, and these attributes" and validate an opened hierarchy against the schema. The convention layer in the [Zarr Stack](../README.md#the-zarr-stack) (level 1) consumes this; OME-NGFF, GeoZarr, and anndata-zarr all hand-roll their own validators today.
 
-**Commitment.** The `__truediv__` and `open_nodes` work is small and lands first in 4.x. `copy_store` / `copy` / `copy_all` ship in 4.x as Python-side functions. The composite-hierarchy story is already in the store layer (`KvStack`) and only needs the documentation surfacing it as the answer to the link request. Declarative schema validation likely benefits from being a separate small package (`zarr-schema`?) layered on `zarr-metadata` and is deferred beyond 4.x; the sequencing section below reflects this.
+**Commitment.** The `__truediv__` and `open_nodes` work is small and ships as an additive 3.x minor (Stream 1, M2 surface). `copy_store` / `copy` / `copy_all` ship as an additive 3.x minor (Stream 1, M2 surface) as Python-side functions. The composite-hierarchy story is already in the store layer (`KvStack`) and only needs the documentation surfacing it as the answer to the link request. Declarative schema validation likely benefits from being a separate small package (`zarr-schema`?) layered on `zarr-metadata` and is deferred beyond the streams below; the sequencing section below reflects this.
 
 ## 2. Chunk-level introspection
 
@@ -30,12 +30,12 @@ The current `zarr.open(...)` / `zarr.create(...)` / `zarr.open_array(...)` famil
 
 Concrete asks:
 
-- **Explicit constructors** to replace `mode=`: `zarr.open_for_read(...)`, `zarr.create(...)` (raises if exists), `zarr.create_or_overwrite(...)`, `zarr.open_or_create(...)`, etc. ([zarr#2466](https://github.com/zarr-developers/zarr-python/issues/2466), [zarr#3976](https://github.com/zarr-developers/zarr-python/issues/3976)). The old `mode=`-taking functions get deprecated, then removed.
+- **Explicit constructors** to replace `mode=`: `zarr.open_for_read(...)`, `zarr.create(...)` (raises if exists), `zarr.create_or_overwrite(...)`, `zarr.open_or_create(...)`, etc. ([zarr#2466](https://github.com/zarr-developers/zarr-python/issues/2466), [zarr#3976](https://github.com/zarr-developers/zarr-python/issues/3976)). The old `mode=`-taking functions get deprecated across the 3.x line (Stream 2), then removed in the single late major (Stream 3).
 - **Typed exception hierarchy** instead of bare `ValueError` / `FileNotFoundError`: `PathExistsError`, `PathNotFoundError`, `InvalidMetadataError`, etc. ([zarr#605](https://github.com/zarr-developers/zarr-python/issues/605), [zarr#2821](https://github.com/zarr-developers/zarr-python/issues/2821)). Lets downstream code `except PathExistsError:` instead of pattern-matching on error messages.
 - **Context-manager protocol on `Array` and `Group`** ([zarr#2619](https://github.com/zarr-developers/zarr-python/issues/2619)). Restores v2's `with zarr.open(...) as g:` pattern; particularly useful for resource-holding stores like `ZipStore`.
 - **Stable async/sync bridge as public API** ([zarr#3835](https://github.com/zarr-developers/zarr-python/discussions/3835)). Xarray needs `zarr.core.sync.sync()` to become a stable public surface; covered architecturally by [stores-wrappers.md § AsyncToSync](./stores-wrappers.md#asynctosyncs) but the user-facing factory and documentation are part of this theme.
 
-**Commitment.** The explicit-constructor family ships in 4.0 alongside the deprecation of the `mode=` family. Typed exceptions ship with the constructor work — they're cheap and the constructor signatures are where the new exception types get raised. Context manager protocol is a small addition; ships with 4.0. The async/sync bridge is already specified in stores-wrappers.md; this theme owns the public re-export and the documentation.
+**Commitment.** The explicit-constructor family ships as an additive 3.x minor (Stream 1, M0 ship-now); the `mode=` family is deprecated in parallel (Stream 2) once the constructors land, and removed only in the single late major (Stream 3). Typed exceptions ship with the constructor work — they're cheap and the constructor signatures are where the new exception types get raised; they ship as an additive 3.x minor (Stream 1, M0 ship-now). Context manager protocol is a small addition; it ships as an additive 3.x minor (Stream 1, M0 ship-now). The async/sync bridge is already specified in stores-wrappers.md; this theme owns the public re-export and the documentation.
 
 ## 4. Display, debugging, and introspection
 
@@ -48,7 +48,7 @@ Concrete asks:
 - **Promote `LatencyStore` to public API** ([zarr#3358](https://github.com/zarr-developers/zarr-python/issues/3358)) — currently buried in tests/internals; useful for users benchmarking their own pipelines. Pairs cleanly with the wrapper protocol from [stores-wrappers.md](./stores-wrappers.md) (`LatencyStore` becomes another wrapper alongside `Caching`, `Retry`, etc.). Also called out as a benchmarking adjunct in [observability.md § Pillar 1](./observability.md#pillar-1-performance-metrics-and-tracing).
 - **Deterministic and pretty-printable metadata output** ([zarr#3281](https://github.com/zarr-developers/zarr-python/issues/3281)) — stable key ordering when serializing `zarr.json`, plus a "pretty" option for human-readable JSON. Important for content-addressed storage, diff workflows, and reproducibility.
 
-**Commitment.** Rich reprs and `tree(meta=False)` ship in 4.0; small, high-visibility improvements that pay back immediately on every user's first session. `LatencyStore` is promoted to a public store wrapper in the same release as the other store wrappers ([stores-wrappers.md](./stores-wrappers.md)). Deterministic metadata output is a single flag on the metadata writer; ships with the `zarr-metadata` package.
+**Commitment.** Rich reprs and `tree(meta=False)` ship as an additive 3.x minor (Stream 1, M0 ship-now); small, high-visibility improvements that pay back immediately on every user's first session. `LatencyStore` is promoted to a public store wrapper in the same release as the other store wrappers ([stores-wrappers.md](./stores-wrappers.md)). Deterministic metadata output is a single flag on the metadata writer; ships with the `zarr-metadata` package.
 
 ## 5. IO conveniences
 
@@ -62,19 +62,25 @@ A handful of long-requested conveniences that don't fit the other themes but eac
 - **`__dask_tokenize__` on Zarr objects** ([zarr#202](https://github.com/zarr-developers/zarr-python/issues/202)) — stable hashing for Dask graph deduplication. One-line integration that the Dask side has been requesting for years.
 - **Configurable attribute serializer hook** ([zarr#156](https://github.com/zarr-developers/zarr-python/issues/156)) — let users register handlers for non-JSON-native values (numpy scalars, numpy arrays, datetimes). Today `group.attrs["x"] = np.float32(1.0)` is silently lossy or raises.
 
-**Commitment.** File-like `ZipStore`, ZEP 8 URLs, and `__dask_tokenize__` are small enough to ship in 4.0 alongside the store and constructor work. The CLI and the rechunking primitive are larger and ship as 4.x increments; the rechunking primitive in particular benefits from the engine architecture being in place so a `zarrs`-engine `rechunk` can be substantially faster than a pure-Python one. The attrs serializer hook ships with the `zarr-metadata` package.
+**Commitment.** File-like `ZipStore` and `__dask_tokenize__` are small enough to ship as an additive 3.x minor (Stream 1, M0 ship-now) alongside the store and constructor work; ZEP 8 URLs ship as an additive 3.x minor (Stream 1, M2 surface). The CLI and the rechunking primitive are larger and ship as additive 3.x minors (Stream 1, M2 surface); the rechunking primitive in particular benefits from the engine architecture being in place so a `zarrs`-engine `rechunk` can be substantially faster than a pure-Python one. The attrs serializer hook ships with the `zarr-metadata` package.
 
 ## 6. Configuration substrate
 
-The current `donfig`-based [`zarr.config`](https://github.com/zarr-developers/zarr-python/blob/main/src/zarr/core/config.py) is being retired in 4.0. The user-facing surface — namespaced keys (e.g. `concurrency.compute_max_workers`), environment-variable overrides (`ZARR_*`), named presets like `"interactive"` — survives; the substrate that holds the values gets replaced. Substrate choice is open (Pydantic settings? a custom thin layer? `attrs` plus env binding?) and will be decided as part of the 4.0 work.
+The current `donfig`-based [`zarr.config`](https://github.com/zarr-developers/zarr-python/blob/main/src/zarr/core/config.py) is being retired. The user-facing surface — namespaced keys (e.g. `concurrency.compute_max_workers`), environment-variable overrides (`ZARR_*`), named presets like `"interactive"` — survives; the substrate that holds the values gets replaced. Substrate choice is open (Pydantic settings? a custom thin layer? `attrs` plus env binding?).
+
+**Sequencing: this is a prerequisite, not a peer.** The typed-concurrency pools and the cache default policy in [performance.md](./performance.md) need somewhere to store their (dask-safe) defaults, presets, and engine-selection keys, so the substrate replacement must land *before* those performance-lever defaults — early in the foundation work (Stream 1, M1 foundation), not bundled with the later user-facing conveniences. This resolves the earlier sequencing ambiguity in favor of "lands first."
 
 The performance proposal's [Default caching policy](./performance.md#default-caching-policy) and [typed concurrency resources](./performance.md#who-owns-the-concurrency-cap) both depend on this work landing.
 
 ## Sequencing
 
-- **4.0**: explicit constructors + typed exceptions, context manager protocol, rich reprs + `tree(meta=False)`, file-like `ZipStore`, `__dask_tokenize__`, deterministic metadata output, configuration substrate replacement. (Chunk introspection, public `ArrayV3Metadata`, and public `LatencyStore` ship in 4.0 too but are owned by [observability.md](./observability.md).)
-- **4.x**: `__truediv__` traversal, `open_nodes`, `copy_store` / `copy` / `copy_all`, ZEP 8 URLs, CLI, in-library rechunking primitive, attrs serializer hook.
-- **Beyond 4.x**: declarative schema validation (likely a separate `zarr-schema` package, follow-on proposal).
+All of the items below ship additively as 3.x minors (Stream 1); the only major-gated work in this theme is the *removal* of the `mode=` family (Stream 3). The tiers below are the Stream 1 sub-ordering from the README Roadmap.
+
+- **M0 (ship-now):** explicit constructors + typed exceptions, context manager protocol, rich reprs + `tree(meta=False)`, file-like `ZipStore`, `__dask_tokenize__`, deterministic metadata output. (Chunk introspection, public `ArrayV3Metadata`, and public `LatencyStore` ship as additive 3.x minors too but are owned by [observability.md](./observability.md).)
+- **M1 (foundation):** configuration substrate replacement (a prerequisite that lands early in the foundation tier — see §6 above).
+- **M2 (surface):** `__truediv__` traversal, `open_nodes`, `copy_store` / `copy` / `copy_all`, ZEP 8 URLs, CLI, in-library rechunking primitive, attrs serializer hook.
+- **Deprecations (Stream 2) / removals (Stream 3):** the `mode=` constructor family is deprecated across the 3.x line (Stream 2) once the explicit constructors ship, and removed in the single late major (Stream 3).
+- **A later Stream 1 minor:** declarative schema validation (likely a separate `zarr-schema` package, follow-on proposal).
 - **Out of scope until a Zarr Enhancement Proposal lands**: persisted hierarchy links. They require defining a new stored object format, which is cross-implementation work that Zarr-Python cannot do unilaterally.
 
 ## Open questions

@@ -267,7 +267,7 @@ Behavioral differences:
 
 For users who want post-decode (decoded-chunk) caching, the right answer is the **hierarchy-layer cache** specified in [hierarchy-layer.md](./hierarchy-layer.md), constructed via `array.with_caching(chunks=True)`. That cache wraps the `read_chunk` verb and stores decoded chunks keyed by `(array_path, chunk_coords)`. It is complementary to the store-layer `Caching[S]`, not a substitute. The two compose: a hierarchy-layer chunk cache wraps the verbs, the verbs call into the store, and a store-layer `Caching[S]` (if configured) catches the encoded-bytes reads.
 
-For the deprecation transition, `experimental.cache_store` keeps emitting a `DeprecationWarning` pointing at `Caching[S]` for one release, then is removed.
+For the deprecation transition, `experimental.cache_store` keeps emitting a `DeprecationWarning` pointing at `Caching[S]` across the 3.x line (Stream 2), and is removed in the single late major (Stream 3).
 
 ## Test plan
 
