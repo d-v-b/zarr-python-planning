@@ -2,7 +2,7 @@
 
 > Theme proposal. For the high-level pitch, see the [parent README](../README.md). See also [functional-core.md](./functional-core.md#concrete-packaging-plan) for the packaging side of the codec story.
 
-In addition to the packaging issues addressed in [functional-core.md](./functional-core.md#case-study-breaking-the-codec-circular-dependency), there are a few other pain points related to codecs that we should fix as part of a Zarr Python 4.0 effort:
+In addition to the packaging issues addressed in [functional-core.md](./functional-core.md#case-study-breaking-the-codec-circular-dependency), there are a few other pain points related to codecs that we should fix as part of a Zarr-Python v4 effort:
 
 - The Zarr Python codec API is unwieldy and inefficient.
 - Many popular Zarr V2 codecs have no Zarr V3 equivalent.
@@ -25,6 +25,8 @@ In order to avoid blocking the `asyncio` event loop these routines are run on a 
 Performance profiling of Zarr Python's codec API routinely flags this unnecessary async layer as a performance bottleneck.
 
 Solution: define `encode` and `decode` as synchronous functions, and define asynchronous `encode_async` / `decode_async` for classes that can make use of this functionality. 
+
+A synchronous single-chunk path is **already merged in `zarr-python`** (`SupportsSyncCodec` / `ChunkTransform`, with `_decode_sync` / `_encode_sync` implemented on every concrete codec). Adopting it on the default array read/write path is therefore an *additive* change that does not depend on the full codec-API rewrite below or on the functional-core refactor — it ships as an additive 3.x minor (Stream 1 · M0), removing the async-wrapping hotspot now, while the rewrite that formalizes the public protocol surface ships as an additive 3.x minor in the foundation work (Stream 1 · M1 perf levers). Scope guard: this sync-adoption step keeps the existing V2-codec *read* path intact and does not touch the Numcodecs-elimination question, both of which are separate, later, and more delicate.
 
 ### Abstraction leakage in the encode / decode function signature
 
@@ -89,7 +91,7 @@ Cross-call decoded-chunk caching is a separate concern, handled at the array lay
 
 Per [performance.md § 1](./performance.md#1-concurrency-is-typed-library-owned-and-shared-across-nested-calls), the library owns typed concurrency resources (`ComputeConcurrency`, `IoConcurrency`) rather than letting every layer spawn threads independently. The codec API surface needed for the *vertical* axis — propagating a budget through the call stack — is `recommended_concurrency() -> RecommendedConcurrency` on every codec: a `{ min: int, max: int }` range describing how much per-codec parallelism the codec can productively use on a given input shape. The pipeline aggregates these ranges and the call's current budget slice (taken from `ComputeConcurrency`) and splits the budget between outer (chunk-level) and inner (codec-level) parallelism such that `outer × inner ≤ target`. The budget strictly shrinks as the call descends; the typed pool's admission queue handles cross-call coordination.
 
-This is the difference between today's "blosc spawns N threads × sharding spawns M threads × chunks spawn P threads" thread explosion and a bounded total. It is the single highest-leverage performance change in the 4.0 set. The codec-side API surface is `recommended_concurrency()` on the base protocol; the library-side machinery (the typed resources and the `calc_concurrency_outer_inner`-equivalent splitter) is in [performance.md § 1](./performance.md#1-concurrency-is-typed-library-owned-and-shared-across-nested-calls).
+This is the difference between today's "blosc spawns N threads × sharding spawns M threads × chunks spawn P threads" thread explosion and a bounded total. It is the single highest-leverage performance change in the v4 set. The codec-side API surface is `recommended_concurrency()` on the base protocol; the library-side machinery (the typed resources and the `calc_concurrency_outer_inner`-equivalent splitter) is in [performance.md § 1](./performance.md#1-concurrency-is-typed-library-owned-and-shared-across-nested-calls).
 
 ### We should learn from Zarrs and Tensorstore
 

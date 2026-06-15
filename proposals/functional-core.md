@@ -77,18 +77,20 @@ Two kinds of objects survive in the new design: **stores** and **codecs**.
 
 ### A thin imperative shell, with engines as namespaces
 
-Higher-level operations become module-level functions, not classes. Concretely an engine exports exactly four functions:
+Higher-level operations become module-level functions, not classes. The chunk- and selection-level core of an engine is four functions:
 
 - `read_chunk(store, metadata, chunk_coords, ...)` — fetch and decode one chunk.
 - `read_selection(store, metadata, plan, ...)` — execute an IO plan covering many chunks for one selection.
 - `write_chunk(store, metadata, chunk_coords, data, ...)` — encode and write one chunk.
 - `write_selection(store, metadata, plan, data, ...)` — execute an IO plan for a multi-chunk write.
 
+These four are the *chunk/selection* core of the engine boundary, **not its entirety.** For an engine to take over end-to-end — including hierarchy traversal, so that "open this group and walk its children" over a remote store does not fall back to one-round-trip-per-child in Python — the boundary is the full **hierarchy-verb set** (`read_array_metadata`, `list_children`, `read_consolidated_metadata`, `write_chunk`, `read_selection`, …) defined in [hierarchy-layer.md](./hierarchy-layer.md). The four functions above are the subset that does chunk IO; the metadata and hierarchy verbs round out the seam. Describing the boundary as "exactly four functions" undercounts it and would force wrapped engines (`zarrs`, TensorStore) to do hierarchy traversal in Python, losing most of the benefit — so where this document and [hierarchy-layer.md](./hierarchy-layer.md) differ, the verb set is authoritative.
+
 The selection functions take an **IO plan** — a pure data structure produced by the core from a metadata document plus a selection. The plan enumerates the chunks to touch, the byte ranges within each, how decoded chunks compose into the output, and any cache-hit short-circuits. Producing the plan is a pure function in the core; executing it is the engine's job. This is the same split as TensorStore's `Spec → ResolvedSpec → IO` pipeline and the natural seam at which alternative engines plug in (see [performance.md § Wrapping `zarrs` and TensorStore as alternative engines](./performance.md#wrapping-zarrs-and-tensorstore-as-alternative-engines)).
 
 There are no `ChunkPipeline`, `CodecPipeline`, or `SliceExecutor` classes. Those were objects whose only purpose was to hold a single method, which is what a function is.
 
-An **engine** is a module that exports those four functions. Zarr-Python ships a default Python engine. Alternative engines are alternative modules. A Zarrs engine is a module whose `read_selection` hands the plan off to Zarrs internally; a TensorStore engine is the equivalent for TensorStore. Mixing across engines — for example, "Python's orchestration with Zarrs' codecs" — is a short module that imports the parts you want from each.
+An **engine** is a module that exports the verb set (the four chunk/selection functions above plus the hierarchy verbs from [hierarchy-layer.md](./hierarchy-layer.md)). Zarr-Python ships a default Python engine. Alternative engines are alternative modules. A Zarrs engine is a module whose `read_selection` hands the plan off to Zarrs internally; a TensorStore engine is the equivalent for TensorStore. Mixing across engines — for example, "Python's orchestration with Zarrs' codecs" — is a short module that imports the parts you want from each.
 
 The public `Array` and `Group` classes are thin facades. An `Array` holds a metadata document, a store, an engine, and a codec registry, and delegates each method to the engine. Switching backends means swapping one of those four pieces of state; the public API does not change.
 
@@ -98,7 +100,7 @@ Per [performance.md § Where the caching substrate sits relative to engines](./p
 
 | Problem | How the new shape resolves it |
 |---|---|
-| Integrating Zarrs/TensorStore requires a bespoke external package | An engine is a module of four functions. An integration with another implementation ships those four functions and inherits everything above the I/O — metadata handling, hierarchy traversal, key encoding — unchanged. |
+| Integrating Zarrs/TensorStore requires a bespoke external package | An engine is a module of verb functions (the chunk/selection core plus the hierarchy verbs). An integration with another implementation ships those verbs and inherits everything above the I/O — metadata handling, key encoding — unchanged, while being able to take over hierarchy traversal too. |
 | Parts of Zarr-Python cannot be used in isolation | The functional core splits cleanly into focused packages (e.g. `zarr-metadata`, `zarr-dtype`, `zarr-codec`). Downstream tools depend on the parts they need. |
 | Async/sync leaks into every layer | Async belongs only in the shell. The same engine has sync and async variants in separate modules; the core is identical for both. The recurring event-loop reentrancy bugs go away because the only place an event loop is involved is the shell. |
 | Testing requires the whole stack | The core is pure functions over pure data. Tests run in milliseconds with no fixtures, no event loops, no stores. |
@@ -118,10 +120,10 @@ Per [performance.md § Where the caching substrate sits relative to engines](./p
 
 ## What this is not
 
-- **Not driving the 4.0 API changes.** This refactor is internal — the `zarr.open`, `zarr.create_array`, `Array[...]`, `Group[...]` surfaces stay where they are when *only* the functional-core work lands. Other 4.0 proposals (codecs, stores, lazy indexing) do change the user-facing API; see [the README's backwards-compatibility section](../README.md#what-we-do-and-dont-commit-to-for-backwards-compatibility) for the project-wide commitment. The functional-core refactor itself is API-neutral; the bigger 4.0 work is not.
+- **Not driving the v4 API changes.** This refactor is internal — the `zarr.open`, `zarr.create_array`, `Array[...]`, `Group[...]` surfaces stay where they are when *only* the functional-core work lands. Other parts of the v4 work (codecs, stores, lazy indexing) do change the user-facing API — delivered additively first across the 3.x line, with the breaking removals concentrated in the single late major (Stream 3); see [the README's backwards-compatibility section](../README.md#what-we-do-and-dont-commit-to-for-backwards-compatibility) for the project-wide commitment. The functional-core refactor itself is API-neutral; the bigger v4 work is not.
 - **Not a function-by-function API design.** This document argues the direction and the shape of the solution. Concrete signatures and module layouts are deferred to follow-on proposals.
 - **Not a redesign of the store layer.** The existing stores proposal stands; we add only the serialization capability that lets stores cross language boundaries.
-- **Not a single-release push.** The refactor is incremental and staged. The functional core can be extracted and tested alongside the existing internals; engines can be added one at a time; the public facade can migrate to delegating into the core gradually, with no flag day.
+- **Not a single-release push.** The refactor is incremental and staged — it ships as additive 3.x minors (Stream 1 · M1 structural refactor), not behind a major. The functional core can be extracted and tested alongside the existing internals; engines can be added one at a time; the public facade can migrate to delegating into the core gradually, with no flag day.
 
 ## Concrete packaging plan
 
@@ -129,7 +131,7 @@ The functional core gives us clean seams along which `zarr-python` can be split 
 
 ### The packages
 
-- [`zarr-metadata`](https://github.com/zarr-developers/zarr-metadata) — **already shipped** ([on PyPI](https://pypi.org/project/zarr-metadata/)). Pure data structures and parsers for Zarr V2 and V3 metadata documents. Also owns the **chunk-addressing** types — `ChunkGrid` (regular and Rectilinear), `ChunkKeyEncoding` (V2 and V3 variants, including future entries from `zarr-extensions`) — because they are pure-data descriptions consumed by both metadata parsing and chunk lookup. This is the package that grows when a new chunk grid or key encoding is specified, which is one of the README's 4.0 acceleration goals. The other three packages below follow the same pattern.
+- [`zarr-metadata`](https://github.com/zarr-developers/zarr-metadata) — **already shipped** ([on PyPI](https://pypi.org/project/zarr-metadata/)). Pure data structures and parsers for Zarr V2 and V3 metadata documents. Also owns the **chunk-addressing** types — `ChunkGrid` (regular and Rectilinear), `ChunkKeyEncoding` (V2 and V3 variants, including future entries from `zarr-extensions`) — because they are pure-data descriptions consumed by both metadata parsing and chunk lookup. This is the package that grows when a new chunk grid or key encoding is specified, which is one of the README's v4 acceleration goals. The other three packages below follow the same pattern.
 - `zarr-dtype` — Zarr data type system.
 - `zarr-codec` — the codec interface (no concrete codec implementations). Defines the `Codec` protocol family, `recommended_concurrency`, `PartialDecodeCapability`, `decode_into`, and so on. Codec implementations live in `zarr-python` or in third-party packages that depend on `zarr-codec`.
 - `zarr-store` — the store interface (capability protocols).

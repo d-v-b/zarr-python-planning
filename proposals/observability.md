@@ -4,7 +4,7 @@
 
 ## Summary
 
-Observability is the property that lets a user, an ops team, or a downstream library answer two questions at runtime: **"what is my Zarr-Python deployment doing?"** and **"what is actually in my Zarr data?"** Both questions are answered poorly today. Performance issues require sampling profilers and source-reading to diagnose; cache hit rates and concurrency saturation are invisible; "which chunks of this array are materialized?" requires reaching into private APIs. The 4.0 work fixes both, on the same substrate as the rest of the proposal set.
+Observability is the property that lets a user, an ops team, or a downstream library answer two questions at runtime: **"what is my Zarr-Python deployment doing?"** and **"what is actually in my Zarr data?"** Both questions are answered poorly today. Performance issues require sampling profilers and source-reading to diagnose; cache hit rates and concurrency saturation are invisible; "which chunks of this array are materialized?" requires reaching into private APIs. The v4 work fixes both, on the same substrate as the rest of the proposal set.
 
 This proposal has two pillars:
 

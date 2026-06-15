@@ -51,9 +51,9 @@ The question has been raised explicitly in [`zarr-python#2197`](https://github.c
 
 The end state is that `Array.__getitem__` *itself* returns a lazy view. We get there without splitting the codebase into two array types. The migration runs entirely on the existing `Array` class:
 
-- **In 4.0**, `Array` grows an opt-in accessor — `array.lazy[...]` (working name; the actual name is settled in the migration PR). The accessor's `__getitem__` returns an array view bound to the source `Array` plus a composed selection. The bare `array[...]` keeps its existing eager-NumPy behavior; users opt in by going through the accessor.
-- **In a later 4.x release**, `Array.__getitem__` itself flips to return the same view object the accessor returns. The accessor stays as an unambiguous explicit form but becomes a no-op (`array.lazy[...]` and `array[...]` behave identically).
-- **In a future major release** (after the deprecation window completes), the eager path is gone and so is the need for the accessor; `Array.__getitem__` is the only path.
+- **As a 3.x minor (Stream 1 · M2)**, `Array` grows an opt-in accessor — `array.lazy[...]` (working name; the actual name is settled in the migration PR) — built on the `IndexTransform` algebra that lands in Stream 1 · M1. The accessor's `__getitem__` returns an array view bound to the source `Array` plus a composed selection. The bare `array[...]` keeps its existing eager-NumPy behavior; users opt in by going through the accessor. This is purely additive — no default change.
+- **The default flip is a separate decision, not automatic.** If taken — only if Array-API conformance at bare `__getitem__` requires it — `Array.__getitem__` flips to return the same view object the accessor returns, landing as a loud breaking minor with a deprecation window (Stream 2) and an `array.eager[...]` escape hatch, never as a reason to adopt a major version. The accessor stays as an unambiguous explicit form but becomes a no-op (`array.lazy[...]` and `array[...]` behave identically).
+- **In the single late major (Stream 3)** — after the Stream 2 deprecation window completes — the eager path is gone and so is the need for the accessor; `Array.__getitem__` is the only path.
 
 There is never a `LazyArray` class. There is never a period where downstream code has to handle two array types via `isinstance` checks. The change rides on a single type whose `__getitem__` semantics evolve across releases — the same pattern `pathlib.Path` used to absorb `os.path` behaviors without introducing a parallel type.
 
@@ -62,13 +62,13 @@ The view that `array.lazy[...]` returns is *also* an `Array` (or a compatible su
 ```python
 z = zarr.open(...)             # Array
 
-# 4.0: opt-in lazy via accessor; bare __getitem__ is eager NumPy.
+# Stream 1 · M2: opt-in lazy via accessor; bare __getitem__ is eager NumPy.
 arr = z[10:20, :, ::2]         # eager: ndarray, IO happens here.
 v   = z.lazy[10:20, :, ::2]    # lazy: an Array view, no IO yet.
 w   = v[..., 0]                # composed; still no IO.
 arr = np.asarray(w)            # materialization: NumPy out.
 
-# Later 4.x: __getitem__ itself flips. The two forms become equivalent.
+# If the default flip is taken: __getitem__ itself flips. The two forms become equivalent.
 v   = z[10:20, :, ::2]         # lazy by default.
 v   = z.lazy[10:20, :, ::2]    # same.
 ```
@@ -152,21 +152,22 @@ The implicit batching context is the ergonomic win; the explicit form is the one
 
 - **Not a Dask replacement.** Dask handles distribution, scheduling, and computation graphs. This proposal handles IO planning for a single Zarr array surface. Users who want distributed computation continue to use Dask; the difference is that Dask is no longer the *only* way to get basic IO batching.
 - **Not full lazy compute.** Element-wise operations, reductions, and broadcasting are not part of this proposal. The lazy view is a *view onto stored data*, not a deferred computation graph. Arithmetic operations materialize the view as today.
-- **Not a new array type.** The end state is `Array` with lazy semantics, not `LazyArray` next to `Array`. The accessor in 4.0 is the opt-in mechanism; the codebase carries one array type throughout.
-- **Not an immediate flag-day break.** The current eager-numpy behavior remains available behind a flag (or as a deprecated `Array.get_eager(...)` method) through one or more 4.x releases. New code uses the lazy API; existing code keeps working with a deprecation warning.
+- **Not a new array type.** The end state is `Array` with lazy semantics, not `LazyArray` next to `Array`. The opt-in accessor (Stream 1 · M2) is the opt-in mechanism; the codebase carries one array type throughout.
+- **Not an immediate flag-day break.** If the default ever flips, the current eager-numpy behavior remains available behind the `array.eager[...]` escape hatch (or as a deprecated `Array.get_eager(...)` method) through the Stream 2 deprecation window across the 3.x line. New code uses the lazy API; existing code keeps working with a deprecation warning.
 - **Not "make zarr arrays act like numpy arrays."** This proposal pushes the other direction: zarr arrays act like zarr arrays, and conversion to numpy is explicit.
 
-## Migration
+## Sequencing
 
-The transition is staged. No new array *type* is ever introduced; the migration is entirely about the semantics of `Array.__getitem__`.
+The transition maps onto the three streams of the [roadmap](../README.md#roadmap). No new array *type* is ever introduced; the migration is entirely about the semantics of `Array.__getitem__`. The opt-in accessor is additive (Stream 1, no migration); the default flip — *if it happens at all* — can ride a loud minor with a Stream 2 deprecation window; only the eager *removal* needs the single late major (Stream 3).
 
-1. **4.0**: ship the foundational `IndexTransform` algebra ([zarr#3906](https://github.com/zarr-developers/zarr-python/pull/3906)) and the `array.lazy[...]` accessor. The accessor's `__getitem__` returns a lazy view bound to the source `Array`. The bare `array[...]` keeps its existing eager-NumPy behavior. Users opt in by going through the accessor; no downstream code breaks. A deprecation warning starts firing on bare `array[...]` calls in cases where the lazy form would be preferable, pointing users at the accessor.
-2. **4.x**: flip the default of `Array.__getitem__` to lazy. The `array.lazy[...]` accessor stays as an unambiguous explicit form but becomes a no-op (`array.lazy[...]` and `array[...]` behave identically). An escape hatch (`array.eager[...]` or `array[..., eager=True]` or similar — name to be settled) is available for the remaining holdouts and itself emits a deprecation warning.
-3. **A future major release** (after the deprecation window): remove the eager escape hatch and the (now-redundant) `array.lazy[...]` accessor. `Array.__getitem__` is the only path; it is lazy.
+1. **Stream 1 · M1 — foundation.** Ship the foundational `IndexTransform` algebra ([zarr#3906](https://github.com/zarr-developers/zarr-python/pull/3906)), additively as a 3.x minor. This is the substrate the accessor and planner build on.
+2. **Stream 1 · M2 — user-facing surface.** Ship the `array.lazy[...]` accessor and the query planner additively as a 3.x minor. The accessor's `__getitem__` returns a lazy view bound to the source `Array`. The bare `array[...]` keeps its existing eager-NumPy behavior. Users opt in by going through the accessor; no downstream code breaks. No default change here.
+3. **Default flip — a separate decision, not automatic.** Flipping the default of bare `array[...]` is *not* part of the additive work and is taken only if Array-API conformance at bare `__getitem__` requires it. If taken, it lands as a loud breaking minor with a deprecation window (Stream 2): the `array.lazy[...]` accessor stays as an unambiguous explicit form but becomes a no-op (`array.lazy[...]` and `array[...]` behave identically), and an `array.eager[...]` escape hatch (or `array[..., eager=True]` or similar — name to be settled) is available for the remaining holdouts and itself emits a deprecation warning. This rides a minor with a deprecation window — never a reason to adopt a major version.
+4. **Stream 3 — the single late major.** After the Stream 2 deprecation window elapses, remove the eager escape hatch and the (now-redundant) `array.lazy[...]` accessor. `Array.__getitem__` is the only path; it is lazy. This is the only step that requires a major release, and it carries removals only.
 
-Each step is a release boundary, not a flag day. The user-facing surface for the lazy API is published in 4.0 and stable from that point on; only the *default* changes between 4.0 and 4.x. Crucially, **the codebase never carries two array types**: an `Array` is always an `Array`; what changes is what its `__getitem__` returns by default.
+Each step is a release boundary, not a flag day. The user-facing surface for the lazy API is published additively in Stream 1 and stable from that point on; only the *default* changes, and only as a separate Stream 2 decision. Crucially, **the codebase never carries two array types**: an `Array` is always an `Array`; what changes is what its `__getitem__` returns by default.
 
-The interaction with downstream libraries is the load-bearing question for sequencing. Xarray, Dask, and napari all consume `zarr-python`'s eager `__getitem__`; they will need a release that supports both eager and lazy paths before we can flip the default. The transition mirrors the 2.x→3.x migration: announce, give downstreams time, then flip. Because there is no new array type to handle, the downstream change is "accept that `array[...]` now returns a view that materializes on `np.asarray`," not "handle a new `LazyArray` class."
+The interaction with downstream libraries is the load-bearing question for the default flip — it is what gates the flip, not the additive accessor. Xarray (`ZarrArrayWrapper.get_duck_array`), Dask (`is_arraylike` / `getter`), and napari all consume `zarr-python`'s eager `__getitem__`; they will need a release that supports both eager and lazy paths before the default can flip. The transition mirrors the 2.x→3.x migration: announce, give downstreams time, then flip. Because there is no new array type to handle, the downstream change is "accept that `array[...]` now returns a view that materializes on `np.asarray`," not "handle a new `LazyArray` class."
 
 ## Relationship to existing proposals
 
@@ -179,7 +180,7 @@ The interaction with downstream libraries is the load-bearing question for seque
 ## Open questions
 
 - **Selection representation.** Python's `slice` is not expressive enough. Options: a dataclass-based `IndexExpr` algebra (TensorStore-style), a NumPy-fancy-index-style array, or something custom. The choice has downstream implications for the planner.
-- **Naming.** The accessor name (`array.lazy` is the working name; `array.view` and `array.slice` were considered) and the escape-hatch name for stage 2 (`array.eager`, `array[..., eager=True]`, or similar). The internal `IndexTransform` name is settled by the [in-flight PR](https://github.com/zarr-developers/zarr-python/pull/3906); it's an internal data structure and not user-facing, so its name is not load-bearing for documentation.
+- **Naming.** The accessor name (`array.lazy` is the working name; `array.view` and `array.slice` were considered) and the escape-hatch name for the default flip (`array.eager`, `array[..., eager=True]`, or similar). The internal `IndexTransform` name is settled by the [in-flight PR](https://github.com/zarr-developers/zarr-python/pull/3906); it's an internal data structure and not user-facing, so its name is not load-bearing for documentation.
 - **Materialization API.** `np.asarray(view)` is automatic; `view.compute()` is explicit. Do we want both? Just one? Does it return NumPy specifically, or whatever the array-api `__array_namespace__` resolution gives us?
 - **Batching boundary.** Is `with zarr.batch():` the right shape, or do we want something more like a session object that batches its own calls? The TensorStore `Batch` API is one reference point.
 - ~~Interaction with caching.~~ **Resolved** by [performance.md § Caching](./performance.md#caching): the query planner sits *above* the cache substrate. Building an IO plan consults the cache and the in-flight-dedup table; chunks already in cache produce no IO in the resulting plan, chunks with an in-flight read produce a join-the-future entry rather than a duplicate fetch. The cache layer is responsible for storage and eviction; the planner is responsible for what to fetch.

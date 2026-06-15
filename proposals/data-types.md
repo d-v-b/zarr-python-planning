@@ -8,7 +8,7 @@ Zarr-Python's data-type system currently covers NumPy's built-in dtypes well and
 
 This proposal commits to first-class support. The mechanism is straightforward: either `ml_dtypes` becomes an optional dependency of `zarr-python` (lighter delta, single package), or the definitions live in a separate `zarr-ml-dtypes` package (cleaner separation, one more package to publish). Either way, users get to store and read these dtypes through the same APIs as everything else.
 
-The broader data-type work — ragged arrays, vlen strings, dtype/codec interactions, registry issues — is also in scope but treated as follow-on work. ML dtypes are the load-bearing case because they unblock a specific, large, growing user community (ML practitioners using Zarr for model weights and training data) that Zarr-Python is currently failing.
+The broader data-type work — ragged arrays, vlen strings, dtype/codec interactions, registry issues — is also in scope but treated as follow-on work, building on the `zarr-dtype` substrate from the foundation work (Stream 1 · M1 structural refactor). ML dtypes are the load-bearing case because they unblock a specific, large, growing user community (ML practitioners using Zarr for model weights and training data) that Zarr-Python is currently failing.
 
 ## The problem
 
@@ -36,7 +36,7 @@ Either way, the user-facing story is the same: install `zarr[ml]` (or `zarr-ml-d
 
 ## Other data-type gaps (follow-on work)
 
-The same dtype infrastructure work should address these, but they ship after the ML dtypes:
+The same dtype infrastructure work should address these, but they ship as subsequent 3.x minors (Stream 1) after the ML dtypes:
 
 - **Ragged arrays** ([zarr#2618](https://github.com/zarr-developers/zarr-python/issues/2618)) — variable-length elements per index. Useful for sequence data, sparse arrays, text. Requires extending the metadata schema, not just adding a type.
 - **Variable-length strings** ([zarr#3102](https://github.com/zarr-developers/zarr-python/issues/3102)) — first-class support for `str` and `bytes` data without per-element length-prefix gymnastics.
@@ -49,7 +49,7 @@ The mechanism in the [`zarr-dtype` package](./functional-core.md#the-packages) �
 
 The data-type gaps that ML dtypes don't fix — nullable scalars, variable-length strings, structured / nested types, ragged data — are all things [Apache Arrow](https://arrow.apache.org/) handles natively. Arrow has a well-defined columnar memory format, first-class null masks, variable-length and nested types as primitive constructs, and a stable cross-language data model used by Polars, DuckDB, Parquet, Iceberg, and most of the modern analytical-data stack. Many of the dtypes Zarr-Python users have been asking about for years are *easy* in Arrow and *hard or impossible* in NumPy.
 
-This proposal **commits to investigating how to integrate Arrow data structures with Zarr-Python**, without committing to a specific shape of integration in 4.0. The investigation is itself the deliverable.
+This proposal **commits to investigating how to integrate Arrow data structures with Zarr-Python**, without committing to a specific shape of integration. The investigation is itself the deliverable.
 
 ### What we know is true
 
@@ -69,9 +69,9 @@ These are real open questions, not rhetorical ones:
 
 ### What we commit to
 
-For 4.0: an **investigation document** (likely `proposals/arrow-integration.md` once it exists) that catalogs the design space, prototypes the smallest useful end-to-end path (probably a `to_arrow()` materialization for nullable-int and vlen-string types), and identifies which questions can be answered without spec work and which need a ZEP.
+The Arrow investigation ships as M2 (Stream 1): an **investigation document** (likely `proposals/arrow-integration.md` once it exists) that catalogs the design space, prototypes the smallest useful end-to-end path (probably a `to_arrow()` materialization for nullable-int and vlen-string types), and identifies which questions can be answered without spec work and which need a ZEP.
 
-For 4.x and beyond: depending on what the investigation finds, either a focused proposal that ships specific integration features, or a deferred-with-reasoning note explaining what we learned and why we held off.
+Beyond that: depending on what the investigation finds, either a focused proposal that ships specific integration features as subsequent 3.x minors (Stream 1), or a deferred-with-reasoning note explaining what we learned and why we held off.
 
 The honest framing: **investigating the right way to integrate Arrow with Zarr is itself a valuable project**, even if the answer turns out to be "the right way is small" or "not yet." Committing to the investigation is a deliverable; committing to a specific design we don't have evidence for is overreach.
 
@@ -84,7 +84,7 @@ The honest framing: **investigating the right way to integrate Arrow with Zarr i
 ## Open questions
 
 - **Option A vs Option B** (single optional dependency vs separate package). Recommendation is Option A; verify `ml_dtypes` is well-behaved as a dependency before committing.
-- **Which ML dtypes are in scope for 4.0** vs which can wait. `bfloat16` is non-negotiable. The float8 variants and int4/uint4 should land in the same release; they all live in the same `ml_dtypes` package, so the cost is uniform once the integration is built.
-- **Metadata schema for ML dtypes.** Zarr V3 has a string-based dtype identifier convention; the ML dtypes need stable identifiers. The Zarr V3 spec has not standardized these formally yet; coordinating with the spec process (probably via a [Zarr Enhancement Proposal](https://zarr.dev/zeps/)) is part of the work.
+- **Which ML dtypes ship in the first additive 3.x minor (Stream 1 · M0)** vs which can wait. `bfloat16` is non-negotiable. The float8 variants and int4/uint4 should land in the same release; they all live in the same `ml_dtypes` package, so the cost is uniform once the integration is built.
+- **Metadata schema for ML dtypes.** Zarr V3 uses string-based dtype identifiers, and **most of these are already registered in [`zarr-extensions`](https://github.com/zarr-developers/zarr-extensions)** (`bfloat16`, `int4`, `uint4`, and the `float8_*` family, each with an exact name, fill-value encoding, and byte layout). The conformance obligation is therefore consistency with these published spec documents. The one common ML type **not** yet registered is `float8_e4m3fn` (the OCP FP8 E4M3 used on H100/TPU and by PyTorch/JAX); registering it in `zarr-extensions` is a prerequisite cross-repo PR before zarr-python can write it.
 - **Hardware-specific variants** (e.g. NVIDIA's `e4m3` vs `e4m3fn` differ in NaN handling). The `ml_dtypes` package distinguishes these; the metadata identifiers need to too.
 - **The Arrow investigation** (see the dedicated section above) has its own set of open questions — user-facing surface, depth of integration, metadata schema, codec interaction, engine boundary. Those are by definition unresolved; the investigation is what resolves them.
