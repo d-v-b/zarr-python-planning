@@ -1,0 +1,19 @@
+[project]
+name = "zarr-v4-api-preview"
+version = "0.0.0"
+description = "Non-functional API stubs previewing the projected Zarr-Python v4 final-state API. Not a real package."
+requires-python = ">=3.12"
+
+[project.optional-dependencies]
+docs = [
+    "mkdocs-material",
+    "mkdocstrings[python]",
+    "ruff",  # mkdocstrings uses it to format rendered signatures (separate_signature)
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
