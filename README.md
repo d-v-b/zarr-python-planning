@@ -234,6 +234,12 @@ The user-facing APIs that don't fit into the other themes but that users have be
 
 → [proposals/missing-apis.md](./proposals/missing-apis.md)
 
+### Coordinated and Distributed Writes
+
+Zarr-Python's write path is still user-coordinated: it assumes one process holds the array open and the caller handles not-clobbering, create-before-write, and cleanup. The two patterns that actually produce large Zarr archives — parallel disjoint-region writes (a coordinator creates the array, N workers each fill a non-overlapping slab) and append-along-axis growth — have no design home. Draw the line between what Zarr-Python provides directly on plain v3 (disjoint chunk-aligned region writes, a create-then-hand-out-regions primitive with chunk-alignment *checked* not assumed, single-writer resize/append — none needing a format change) and what it cannot provide there but instead *enables* by exposing the seam a transactional engine builds on (atomicity, reader isolation, recovery, concurrent appenders, conflict resolution), so that coordination extends the Zarr hierarchy rather than living in a parallel format.
+
+→ [proposals/coordinated-writes.md](./proposals/coordinated-writes.md)
+
 ## Roadmap
 
 > **Revision note.** An earlier version of this section sequenced the work as four serial phases gated behind a single breaking **4.0** release. On closer examination that sequencing concentrates migration cost and user-visible payoff in the wrong places: the foundation is *additive* (it needs no breaking release), while the only irreducibly breaking work is a small set of *removals*. This section is re-sequenced accordingly — additive value ships continuously as EffVer minors, deprecations accumulate across that line, and breaking removals are concentrated in a single, late, well-signposted major. **"v4" names this whole body of work, delivered across many releases — it is not a single feature release.** Concretely: the additive work ships as EffVer **3.x minor releases**, deprecations accumulate across the 3.x line, and the only release literally numbered **4.0.0** is the final, minimal, removals-only major. There is no big-bang "4.0" feature release; where this document earlier said "4.0 work" it now says "v4 work" to make that explicit.
