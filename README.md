@@ -4,7 +4,7 @@ Plans for the future of Zarr-Python.
 
 ## Who we are
 
-This document is written by the [zarr-python core developers](https://github.com/zarr-developers/zarr-python). The proposals below are our shared assessment of the project's direction; the work to deliver them will run through the normal Zarr-Python development process — public discussion on the proposals, PRs against the [`zarr-developers/zarr-python`](https://github.com/zarr-developers/zarr-python) repository, and the existing release cadence.
+This document is written by a couple of [zarr-python core developers](https://github.com/zarr-developers/zarr-python), with the intention to incorporate feedback from the full developer group along with stakeholders. The proposals below are our shared assessment of the project's direction; the work to deliver them will run through the normal Zarr-Python development process — public discussion on the proposals, PRs against the [`zarr-developers/zarr-python`](https://github.com/zarr-developers/zarr-python) repository, and the existing release cadence.
 
 ## Audience
 
