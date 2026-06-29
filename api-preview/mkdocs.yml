@@ -1,0 +1,143 @@
+site_name: Zarr-Python v4 — API Preview
+site_description: A projected, non-functional preview of the Zarr-Python public API after the v4 plan lands.
+repo_name: d-v-b/zarr-python-planning
+repo_url: https://github.com/d-v-b/zarr-python-planning
+
+# The embedded proposals (docs/proposals -> ../../proposals) cross-link the parent
+# README.md and use anchors across the full set; those targets aren't part of this
+# site, so downgrade link checks to keep `--strict` builds clean.
+validation:
+  nav:
+    omitted_files: info
+    not_found: warn
+  links:
+    not_found: ignore
+    anchors: ignore
+    absolute_links: ignore
+    unrecognized_links: ignore
+
+theme:
+  name: material
+  features:
+    # Collapsible left nav: nested sections (Proposals, API reference, ...) get
+    # expand/collapse arrows. (Enabling `navigation.sections` would flatten them
+    # into static, non-collapsible headers; `navigation.expand` would force them
+    # all open — so we enable neither.)
+    - navigation.indexes
+    - navigation.top
+    - content.code.copy
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - tables
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+  - mkdocstrings:
+      enable_inventory: true
+      default_handler: python
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_root_heading: true
+            show_root_full_path: false
+            show_source: false
+            show_if_no_docstring: true
+            members_order: source
+            docstring_section_style: table
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+            merge_init_into_class: true
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+          # External inventories, mirroring zarr-developers/zarr-python's mkdocs.yml,
+          # so references to stdlib / numpy / fsspec / obstore / dask / xarray / ...
+          # types resolve to their upstream docs.
+          inventories:
+            - https://docs.python.org/3/objects.inv
+            - https://docs.xarray.dev/en/stable/objects.inv
+            - https://numpy.org/doc/stable/objects.inv
+            - https://numcodecs.readthedocs.io/en/stable/objects.inv
+            - https://developmentseed.org/obstore/latest/objects.inv
+            - https://filesystem-spec.readthedocs.io/en/latest/objects.inv
+            - https://requests.readthedocs.io/en/latest/objects.inv
+            - https://docs.aiohttp.org/en/stable/objects.inv
+            - https://s3fs.readthedocs.io/en/latest/objects.inv
+            - https://docs.h5py.org/en/stable/objects.inv
+            - https://icechunk.io/en/stable/objects.inv
+            - https://lithops-cloud.github.io/docs/objects.inv
+            - https://docs.dask.org/en/stable/objects.inv
+
+nav:
+  - Home: README.md
+  - Proposals:
+      - Functional core: proposals/functional-core.md
+      - Hierarchy layer: proposals/hierarchy-layer.md
+      - Codecs: proposals/codecs.md
+      - Data types: proposals/data-types.md
+      - Device-agnostic IO: proposals/gpu.md
+      - Lazy indexing: proposals/lazy-indexing.md
+      - Performance: proposals/performance.md
+      - Observability: proposals/observability.md
+      - Missing APIs: proposals/missing-apis.md
+      - Coordinated writes: proposals/coordinated-writes.md
+      - Consolidated metadata: proposals/consolidated-metadata.md
+      - Stores (overview): proposals/stores.md
+      - Stores — API: proposals/stores-api.md
+      - Stores — wrappers: proposals/stores-wrappers.md
+      - Stores — caching: proposals/stores-caching.md
+      - Stores — range coalescing: proposals/stores-range-coalescing.md
+      - Stores — transactional: proposals/stores-transactional.md
+      - Stores — conformance: proposals/stores-conformance.md
+  
+  - API preview:
+      - Overview: about-preview.md
+      - The Zarr stack: stack.md
+      - Future API (v4 final state):
+          - Overview: api/index.md
+          - Arrays: api/array.md
+          - Groups: api/group.md
+          - Creating arrays & groups: api/create.md
+          - Opening hierarchies: api/open.md
+          - Metadata: api/metadata.md
+          - Data types: api/dtype.md
+          - Codecs: api/codec.md
+          - Stores: api/store.md
+          - Hierarchy verbs: api/hierarchy.md
+          - Engines: api/engines.md
+          - Concurrency: api/concurrency.md
+          - Observability: api/observability.md
+          - Configuration: api/config.md
+          - Errors: api/errors.md
+      - Deprecated (removed in 4.0):
+          - Overview: removed/index.md
+          - Migration map: migration.md
+          - Store ABC: removed/stores.md
+          - Codec ABCs: removed/codecs.md
+          - Buffer / prototype: removed/buffer.md
+          - sync() bridge: removed/sync.md
+          - mode= constructors: removed/constructors.md
+          - Eager indexing: removed/indexing.md
+          - StorePath: removed/storage.md
+          - donfig config: removed/config.md
+      - Deferred items: deferred-items.md
