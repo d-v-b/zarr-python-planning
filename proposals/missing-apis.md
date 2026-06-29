@@ -4,7 +4,7 @@
 
 The proposals in the rest of this set address the load-bearing structural work: the functional-core refactor, the codec API, the store-layer redesign, lazy indexing, the cross-cutting performance work (which folds in caching and concurrency), and observability (which folds in chunk-level stored-state introspection). This document collects the user-facing APIs that don't fit into any of those themes but that users have been asking for — in some cases for years.
 
-The catalog is not exhaustive. It is the result of an audit of open feature requests and discussions in the [zarr-developers/zarr-python](https://github.com/zarr-developers/zarr-python) issue tracker, filtered to user-facing API gaps that aren't already covered by another proposal. Items are grouped into six numbered themes plus a configuration substrate section. One of the themes (Chunk-level introspection) is now a pointer to [observability.md](./observability.md) where the work actually lives; the rest are owned here. Each theme has a paragraph of motivation, a list of the concrete asks, and a commitment.
+The catalog is not exhaustive. It is the result of an audit of open feature requests and discussions in the [zarr-developers/zarr-python](https://github.com/zarr-developers/zarr-python) issue tracker, filtered to user-facing API gaps that aren't already covered by another proposal. Items are grouped into six numbered themes. Two of them are now pointers to where the work actually lives: Chunk-level introspection to [observability.md](./observability.md), and the configuration substrate to [configuration.md](./configuration.md). The rest are owned here. Each theme has a paragraph of motivation, a list of the concrete asks, and a commitment.
 
 ## 1. Hierarchy navigation and manipulation
 
@@ -66,18 +66,16 @@ A handful of long-requested conveniences that don't fit the other themes but eac
 
 ## 6. Configuration substrate
 
-The current `donfig`-based [`zarr.config`](https://github.com/zarr-developers/zarr-python/blob/main/src/zarr/core/config.py) is being retired. The user-facing surface — namespaced keys (e.g. `concurrency.compute_max_workers`), environment-variable overrides (`ZARR_*`), named presets like `"interactive"` — survives; the substrate that holds the values gets replaced. Substrate choice is open (Pydantic settings? a custom thin layer? `attrs` plus env binding?).
+The configuration, registry, and plugin machinery — retiring the untyped `donfig`-based [`zarr.config`](https://github.com/zarr-developers/zarr-python/blob/main/src/zarr/core/config.py) in favor of typed, explicitly-passed configuration; redesigning the registries for stable addressing and plugin-conflict resolution; and collapsing the register-and-configure dance into a single explicit argument — now has its own theme proposal: **[configuration.md](./configuration.md)**.
 
-**Sequencing: this is a prerequisite, not a peer.** The typed-concurrency pools and the cache default policy in [performance.md](./performance.md) need somewhere to store their (dask-safe) defaults, presets, and engine-selection keys, so the substrate replacement must land *before* those performance-lever defaults — early in the foundation work (Stream 1, M1 foundation), not bundled with the later user-facing conveniences. This resolves the earlier sequencing ambiguity in favor of "lands first."
-
-The performance proposal's [Default caching policy](./performance.md#default-caching-policy) and [typed concurrency resources](./performance.md#who-owns-the-concurrency-cap) both depend on this work landing.
+It remains a **prerequisite, not a peer**: the typed-concurrency pools and the cache default policy in [performance.md](./performance.md) need somewhere to store their (dask-safe) defaults, presets, and engine-selection keys, so the substrate replacement must land *before* those performance-lever defaults — early in the foundation work (Stream 1, M1 foundation). See [configuration.md § 8](./configuration.md#8-sequencing-within-the-v4-streams) for the full sequencing.
 
 ## Sequencing
 
 All of the items below ship additively as 3.x minors (Stream 1); the only major-gated work in this theme is the *removal* of the `mode=` family (Stream 3). The tiers below are the Stream 1 sub-ordering from the README Roadmap.
 
 - **M0 (ship-now):** explicit constructors + typed exceptions, context manager protocol, rich reprs + `tree(meta=False)`, file-like `ZipStore`, `__dask_tokenize__`, deterministic metadata output. (Chunk introspection, public `ArrayV3Metadata`, and public `LatencyStore` ship as additive 3.x minors too but are owned by [observability.md](./observability.md).)
-- **M1 (foundation):** configuration substrate replacement (a prerequisite that lands early in the foundation tier — see §6 above).
+- **M1 (foundation):** configuration substrate replacement (a prerequisite that lands early in the foundation tier — now owned by [configuration.md](./configuration.md); see §6 above).
 - **M2 (surface):** `__truediv__` traversal, `open_nodes`, `copy_store` / `copy` / `copy_all`, ZEP 8 URLs, CLI, in-library rechunking primitive, attrs serializer hook.
 - **Deprecations (Stream 2) / removals (Stream 3):** the `mode=` constructor family is deprecated across the 3.x line (Stream 2) once the explicit constructors ship, and removed in the single late major (Stream 3).
 - **A later Stream 1 minor:** declarative schema validation (likely a separate `zarr-schema` package, follow-on proposal).
